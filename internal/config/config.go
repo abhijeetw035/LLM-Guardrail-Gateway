@@ -1,0 +1,50 @@
+// Package config holds gateway configuration loaded from environment variables.
+// All fields have sensible defaults so the gateway runs without any env vars set.
+package config
+
+import (
+	"os"
+	"strconv"
+)
+
+// Config holds all tunable gateway settings.
+type Config struct {
+	// ListenAddr is the address the gateway HTTP server binds to.
+	ListenAddr string
+
+	// MockLLMAddr is the base URL of the mock LLM server.
+	MockLLMAddr string
+
+	// MaxBodyBytes is the hard cap on request body size (default 512 KB).
+	// Requests exceeding this are rejected with 413 before any parsing.
+	MaxBodyBytes int64
+
+	// LogLevel controls minimum log verbosity ("info", "warn", "error").
+	LogLevel string
+}
+
+// Load reads config from environment variables, applying defaults where unset.
+func Load() Config {
+	return Config{
+		ListenAddr:   getEnv("GATEWAY_LISTEN_ADDR", ":8080"),
+		MockLLMAddr:  getEnv("MOCK_LLM_ADDR", "http://localhost:9090"),
+		MaxBodyBytes: getEnvInt64("GATEWAY_MAX_BODY_BYTES", 512*1024), // 512 KB
+		LogLevel:     getEnv("GATEWAY_LOG_LEVEL", "info"),
+	}
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func getEnvInt64(key string, fallback int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return fallback
+}

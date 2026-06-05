@@ -220,7 +220,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 // handleStream processes POST /v1/stream.
 //
 // It forwards the prompt to the mock LLM's SSE stream endpoint and pipes
-// the response through the sliding window buffer. The window holds N bytes
+// the raw SSE bytes through the sliding window buffer. The window holds N bytes
 // before forwarding so the output scanner always has lookahead — unsafe
 // content is detected before it reaches the client.
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
@@ -250,7 +250,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Input guardrail scan (same as /v1/complete).
+	// Input guardrail scan.
 	scanResult := s.scanner.Scan(r.Context(), req.Prompt)
 	s.log.Info("guardrail_scan", map[string]any{
 		"request_id": reqID,
@@ -269,10 +269,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Call mock LLM stream endpoint.
+	// Build mock LLM URL, forwarding any query params from the client request
+	// (e.g. ?unsafe=true used in testing to trigger the unsafe payload path).
+	streamURL := s.cfg.MockLLMAddr + "/stream"
+	if q := r.URL.RawQuery; q != "" {
+		streamURL += "?" + q
+	}
+
 	body, _ := json.Marshal(mockLLMRequest{Prompt: req.Prompt})
-	llmReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
-		s.cfg.MockLLMAddr+"/stream", bytes.NewReader(body))
+	llmReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, streamURL, bytes.NewReader(body))
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "internal_error", reqID)
 		return
@@ -300,50 +305,47 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	win := streaming.NewWindow(s.cfg.WindowSize)
 	start := time.Now()
-	aborted := false
+	chunk := make([]byte, 256)
 
-	// Read SSE chunks from mock LLM, push each into the window, forward safe prefix.
-	err = streaming.ReadSSEChunks(llmResp.Body, func(data []byte) bool {
-		// Write chunk into the window buffer.
-		win.Write(data)
-
-		// Scan and forward the safe prefix.
-		result, werr := win.Flush(w)
-		if werr != nil {
-			return false // client write error, stop
+	// Read raw SSE bytes from the mock LLM and push them through the window.
+	// Raw bytes include "data: word\n\n" — the window forwards them unchanged,
+	// so the client receives proper SSE format. The scanner sees the full text
+	// (including any PII embedded in the payload) and can match across chunk
+	// boundaries because the window tail is never discarded until cleared.
+	for {
+		n, readErr := llmResp.Body.Read(chunk)
+		if n > 0 {
+			win.Write(chunk[:n])
+			result, werr := win.Flush(w)
+			if werr != nil {
+				break
+			}
+			if result == streaming.ScanAbort {
+				s.log.Warn("stream_aborted_unsafe_output", map[string]any{
+					"request_id":  reqID,
+					"tenant_id":   tenant.ID,
+					"duration_ms": time.Since(start).Milliseconds(),
+				})
+				fmt.Fprintf(w, "data: {\"error\":\"output_policy_violation\",\"request_id\":%q}\n\n", reqID)
+				if canFlush {
+					flusher.Flush()
+				}
+				return
+			}
+			if canFlush {
+				flusher.Flush()
+			}
 		}
-		if result == streaming.ScanAbort {
-			aborted = true
-			return false
+		if readErr == io.EOF {
+			break
 		}
-		if canFlush {
-			flusher.Flush()
+		if readErr != nil {
+			s.log.Error("stream_read_error", map[string]any{"request_id": reqID, "error": readErr.Error()})
+			return
 		}
-		return true
-	})
-
-	if aborted {
-		// The output scanner detected unsafe content. Write an SSE error sentinel
-		// so the client knows the stream was terminated by policy.
-		// No unsafe bytes have been forwarded — the window held them.
-		s.log.Warn("stream_aborted_unsafe_output", map[string]any{
-			"request_id":  reqID,
-			"tenant_id":   tenant.ID,
-			"duration_ms": time.Since(start).Milliseconds(),
-		})
-		fmt.Fprintf(w, "data: {\"error\":\"output_policy_violation\",\"request_id\":%q}\n\n", reqID)
-		if canFlush {
-			flusher.Flush()
-		}
-		return
 	}
 
-	if err != nil {
-		s.log.Error("stream_read_error", map[string]any{"request_id": reqID, "error": err.Error()})
-		return
-	}
-
-	// Drain whatever is still in the window buffer after the stream ends.
+	// Drain the remaining window buffer after the stream ends.
 	result, _ := win.DrainSafe(w)
 	if result == streaming.ScanAbort {
 		s.log.Warn("stream_aborted_unsafe_output_drain", map[string]any{"request_id": reqID})
@@ -353,9 +355,6 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-
-	// Send SSE done sentinel.
-	fmt.Fprintf(w, "data: [DONE]\n\n")
 	if canFlush {
 		flusher.Flush()
 	}
@@ -366,6 +365,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		"duration_ms": time.Since(start).Milliseconds(),
 	})
 }
+
 
 // mockLLMRequest is the payload sent to the mock LLM server.
 type mockLLMRequest struct {

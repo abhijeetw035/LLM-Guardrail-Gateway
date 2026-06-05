@@ -18,6 +18,8 @@ import (
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/config"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/guardrails/input"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/logger"
+	"github.com/abhijeetw035/llm-guardrail-gateway/internal/policy"
+	"github.com/abhijeetw035/llm-guardrail-gateway/internal/policy/dsl"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/streaming"
 )
 
@@ -46,6 +48,7 @@ type Server struct {
 	mux       *http.ServeMux
 	authStore *auth.Store
 	scanner   *input.Scanner
+	policy    *policy.Watcher // nil if no policy file configured
 }
 
 // New creates a Server and registers all routes.
@@ -58,6 +61,20 @@ func New(cfg config.Config, log *logger.Logger) *Server {
 		authStore: auth.DefaultStore(),
 		scanner:   input.NewScanner(),
 	}
+
+	if cfg.PolicyFile != "" {
+		w, err := policy.NewWatcher(cfg.PolicyFile, log)
+		if err != nil {
+			log.Error("policy_load_failed", map[string]any{
+				"path":  cfg.PolicyFile,
+				"error": err.Error(),
+			})
+			// Non-fatal: gateway starts without policy enforcement.
+		} else {
+			s.policy = w
+		}
+	}
+
 	s.mux.HandleFunc("/v1/complete", s.handleComplete)
 	s.mux.HandleFunc("/v1/stream", s.handleStream)
 	s.mux.HandleFunc("/healthz", s.handleHealth)
@@ -194,6 +211,24 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// VerdictTag: allow through but the scan log above already records it.
+
+	// --- Policy engine evaluation ---
+	if verdict := s.evalPolicy(tenant.ID, result.Score, "mock-llm-v1"); verdict.Matched && verdict.Action == dsl.ActionBlock {
+		s.log.Warn("policy_blocked", map[string]any{
+			"request_id": reqID,
+			"tenant_id":  tenant.ID,
+			"rule":       verdict.RuleName,
+			"reason":     verdict.Reason,
+		})
+		s.writeJSON(w, http.StatusForbidden, map[string]any{
+			"error":      "policy_block",
+			"rule":       verdict.RuleName,
+			"reason":     verdict.Reason,
+			"request_id": reqID,
+		})
+		return
+	}
+
 	// --- Forward to mock LLM ---
 	llmResp, err := s.callMockLLM(r.Context(), reqID, req.Prompt)
 	if err != nil {
@@ -264,6 +299,23 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			"error":      "guardrail_block",
 			"reason":     "Request blocked by input safety policy",
 			"score":      scanResult.Score,
+			"request_id": reqID,
+		})
+		return
+	}
+
+	// --- Policy engine evaluation ---
+	if verdict := s.evalPolicy(tenant.ID, scanResult.Score, "mock-llm-v1"); verdict.Matched && verdict.Action == dsl.ActionBlock {
+		s.log.Warn("policy_blocked", map[string]any{
+			"request_id": reqID,
+			"tenant_id":  tenant.ID,
+			"rule":       verdict.RuleName,
+			"reason":     verdict.Reason,
+		})
+		s.writeJSON(w, http.StatusForbidden, map[string]any{
+			"error":      "policy_block",
+			"rule":       verdict.RuleName,
+			"reason":     verdict.Reason,
 			"request_id": reqID,
 		})
 		return
@@ -366,6 +418,31 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// evalPolicy builds the context and evaluates the compiled policy bundle.
+func (s *Server) evalPolicy(tenantID string, inputRiskScore float64, reqModel string) dsl.Verdict {
+	if s.policy == nil {
+		return dsl.Verdict{}
+	}
+
+	// have to fetched from Redis.
+	// for now we mock it to a value below the quota block threshold (100k).
+	dailyTokens := 5000.0
+
+	ctx := dsl.EvalContext{
+		InputRiskScore:    inputRiskScore,
+		RequestModel:      reqModel,
+		TenantDailyTokens: dailyTokens,
+	}
+
+	b := s.policy.Bundle()
+	if b == nil || b.TenantID != tenantID {
+		// Either no policy loaded, or policy is for a different tenant.
+		// (Afterwards we will load per-tenant policies. Currently this assumes one global policy file).
+		return dsl.Verdict{}
+	}
+
+	return b.Evaluate(ctx)
+}
 
 // mockLLMRequest is the payload sent to the mock LLM server.
 type mockLLMRequest struct {

@@ -30,19 +30,37 @@ type Config struct {
 	// PolicyFile is the path to the .policy file loaded at startup.
 	// Leave empty to disable policy evaluation.
 	PolicyFile string
+
+	// RedisAddr is the Redis server address ("host:port").
+	// Leave empty to disable all Redis-backed features (rate limiting, quota, policy cache).
+	RedisAddr string
+
+	// RedisPassword is the optional Redis AUTH password.
+	RedisPassword string
+
+	// RateLimitPerMinute is the max requests a single tenant may make per minute.
+	RateLimitPerMinute int
+
+	// DailyTokenQuota is the maximum tokens a tenant may consume in one UTC day.
+	DailyTokenQuota int64
 }
 
 // Load reads config from environment variables, applying defaults where unset.
 func Load() Config {
 	return Config{
-		ListenAddr:   getEnv("GATEWAY_LISTEN_ADDR", ":8080"),
-		MockLLMAddr:  getEnv("MOCK_LLM_ADDR", "http://localhost:9090"),
-		MaxBodyBytes: getEnvInt64("GATEWAY_MAX_BODY_BYTES", 512*1024),
-		LogLevel:     getEnv("GATEWAY_LOG_LEVEL", "info"),
-		WindowSize:   getEnvInt("GATEWAY_WINDOW_SIZE", 512),
-		PolicyFile:   getEnv("GATEWAY_POLICY_FILE", "configs/dev.policy"),
+		ListenAddr:         getEnv("GATEWAY_LISTEN_ADDR", ":8080"),
+		MockLLMAddr:        getEnv("MOCK_LLM_ADDR", "http://localhost:9090"),
+		MaxBodyBytes:       getEnvInt64("GATEWAY_MAX_BODY_BYTES", 512*1024),
+		LogLevel:           getEnv("GATEWAY_LOG_LEVEL", "info"),
+		WindowSize:         getEnvInt("GATEWAY_WINDOW_SIZE", 512),
+		PolicyFile:         getEnv("GATEWAY_POLICY_FILE", "configs/dev.policy"),
+		RedisAddr:          getEnv("REDIS_ADDR", ""),
+		RedisPassword:      getEnv("REDIS_PASSWORD", ""),
+		RateLimitPerMinute: getEnvInt("RATE_LIMIT_PER_MINUTE", 60),
+		DailyTokenQuota:    getEnvInt64("DAILY_TOKEN_QUOTA", 100000),
 	}
 }
+
 
 
 

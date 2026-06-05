@@ -1,0 +1,44 @@
+# Default policy applied to all tenants.
+# Rules are evaluated in order; the first match wins.
+#
+# Available fields:
+#   input.risk_score      float  composite input scanner score (0.0–1.0)
+#   tenant.daily_tokens   float  tokens consumed today
+#   request.model         string model name sent by client
+#
+# Actions: BLOCK | TAG | LOG | REDACT
+# Operators: > < == NOT_IN
+
+policy tenant:dev {
+
+  # Block requests that the input scanner rated as high-risk.
+  # The scanner threshold for blocking is 0.60; this rule adds a DSL-level
+  # check as an explicit policy declaration separate from the scanner code.
+  rule block_high_risk_input {
+    when input.risk_score > 0.55
+    action BLOCK
+    reason "Input risk score exceeds policy threshold"
+  }
+
+  # Tag requests that look mildly suspicious for audit review.
+  rule tag_suspicious_input {
+    when input.risk_score > 0.15
+    action TAG
+    reason "Input risk score above soft threshold — flagged for audit"
+  }
+
+  # Block requests that ask for an unapproved model.
+  # Add models to the allowed list here as they are vetted.
+  rule restrict_model {
+    when request.model NOT_IN ["mock-llm-v1", "mock-llm", "gpt-4o-mini"]
+    action BLOCK
+    reason "Model not approved for this tenant"
+  }
+
+  # Block when the tenant has consumed more than 100 000 tokens today.
+  rule daily_quota {
+    when tenant.daily_tokens > 100000
+    action BLOCK
+    reason "Daily token quota exceeded"
+  }
+}

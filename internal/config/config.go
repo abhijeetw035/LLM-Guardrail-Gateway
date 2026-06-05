@@ -26,6 +26,10 @@ type Config struct {
 	// forwarding a prefix to the client. Larger = more safety latency.
 	// Default 512 bytes (~a few sentences).
 	WindowSize int
+
+	// PolicyFile is the path to the .policy file loaded at startup.
+	// Leave empty to disable policy evaluation.
+	PolicyFile string
 }
 
 // Load reads config from environment variables, applying defaults where unset.
@@ -36,8 +40,10 @@ func Load() Config {
 		MaxBodyBytes: getEnvInt64("GATEWAY_MAX_BODY_BYTES", 512*1024),
 		LogLevel:     getEnv("GATEWAY_LOG_LEVEL", "info"),
 		WindowSize:   getEnvInt("GATEWAY_WINDOW_SIZE", 512),
+		PolicyFile:   getEnv("GATEWAY_POLICY_FILE", "configs/dev.policy"),
 	}
 }
+
 
 
 func getEnv(key, fallback string) string {

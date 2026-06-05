@@ -25,8 +25,7 @@ type Tenant struct {
 }
 
 // Store holds the known API key → Tenant mappings.
-// Keys are stored as-is (no hashing) for simplicity in Phase 2.
-// Phase 5 can swap this for a Redis-backed lookup.
+// Keys are stored as-is (no hashing) for simplicity.
 type Store struct {
 	keys map[string]Tenant
 }
@@ -37,7 +36,6 @@ func NewStore(keys map[string]Tenant) *Store {
 }
 
 // DefaultStore returns a hard-coded store suitable for local development.
-// Replace or extend this with environment-driven config in later phases.
 func DefaultStore() *Store {
 	return NewStore(map[string]Tenant{
 		"key-acme-1234":  {ID: "acme-corp", Name: "Acme Corp"},

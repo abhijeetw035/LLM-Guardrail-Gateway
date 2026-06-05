@@ -128,7 +128,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleComplete processes POST /v1/complete.
 //
-// Flow (Phase 2):
+// Flow:
 //  1. Enforce body size limit — reject 413 before any parsing.
 //  2. Decode JSON prompt.
 //  3. Run input guardrail scan — block or tag based on composite risk score.
@@ -143,7 +143,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Step 1: Enforce body size limit ---
+	// --- Enforce body size limit ---
 	if r.ContentLength > s.cfg.MaxBodyBytes {
 		s.log.Warn("request_body_too_large", map[string]any{
 			"request_id":     reqID,
@@ -155,7 +155,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
 
-	// --- Step 2: Decode the prompt ---
+	// --- Decode the prompt ---
 	var req CompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid_request_body", reqID)
@@ -166,7 +166,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Step 3: Input guardrail scan ---
+	// --- Input guardrail scan ---
 	result := s.scanner.Scan(r.Context(), req.Prompt)
 	s.log.Info("guardrail_scan", map[string]any{
 		"request_id":  reqID,
@@ -192,9 +192,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// VerdictTag: allow through but the scan log above already records it.
-	// Future phases can route tagged requests to a review queue.
-
-	// --- Step 4: Forward to mock LLM ---
+	// --- Forward to mock LLM ---
 	llmResp, err := s.callMockLLM(r.Context(), reqID, req.Prompt)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -210,7 +208,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Step 5: Return response ---
+	// --- Return response ---
 	s.writeJSON(w, http.StatusOK, CompletionResponse{
 		RequestID: reqID,
 		Response:  llmResp,

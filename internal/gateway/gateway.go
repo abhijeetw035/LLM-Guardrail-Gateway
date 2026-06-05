@@ -1,16 +1,12 @@
 // Package gateway implements the HTTP server and request handler.
 //
-//   - Accept POST /v1/complete with a JSON prompt body
-//   - Enforce request body size limit (MaxBytesReader)
-//   - Forward prompt to the mock LLM and return its response
-//   - Structured JSON logging for every request
-//   - GET /healthz for liveness checks
 package gateway
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,7 +14,9 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/abhijeetw035/llm-guardrail-gateway/internal/auth"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/config"
+	"github.com/abhijeetw035/llm-guardrail-gateway/internal/guardrails/input"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/logger"
 )
 
@@ -41,21 +39,23 @@ type errorResponse struct {
 
 // Server wraps the HTTP mux and shared dependencies.
 type Server struct {
-	cfg    config.Config
-	log    *logger.Logger
-	client *http.Client
-	mux    *http.ServeMux
+	cfg       config.Config
+	log       *logger.Logger
+	client    *http.Client
+	mux       *http.ServeMux
+	authStore *auth.Store
+	scanner   *input.Scanner
 }
 
 // New creates a Server and registers all routes.
 func New(cfg config.Config, log *logger.Logger) *Server {
 	s := &Server{
-		cfg: cfg,
-		log: log,
-		// Shared HTTP client used to forward requests to the mock LLM.
-		// Timeout is generous for Phase 1; will be tunable in later phases.
-		client: &http.Client{Timeout: 30 * time.Second},
-		mux:    http.NewServeMux(),
+		cfg:       cfg,
+		log:       log,
+		client:    &http.Client{Timeout: 30 * time.Second},
+		mux:       http.NewServeMux(),
+		authStore: auth.DefaultStore(),
+		scanner:   input.NewScanner(),
 	}
 	s.mux.HandleFunc("/v1/complete", s.handleComplete)
 	s.mux.HandleFunc("/healthz", s.handleHealth)
@@ -67,27 +67,45 @@ func (s *Server) Handler() http.Handler {
 	return s.withMiddleware(s.mux)
 }
 
-// withMiddleware wraps the mux with request-ID injection and request/response logging.
+// withMiddleware chains: request-ID injection → auth → logging.
 func (s *Server) withMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		reqID := newRequestID()
 
-		// Attach request ID to context so handlers can read it.
+		// 1. Attach request ID to context and response header.
 		ctx := context.WithValue(r.Context(), ctxKeyRequestID{}, reqID)
 		r = r.WithContext(ctx)
-
-		// Surface the request ID to the caller as a response header.
 		w.Header().Set("X-Request-ID", reqID)
 
+		// 2. Authenticate — /healthz is exempt.
+		var tenantID string
+		if r.URL.Path != "/healthz" {
+			tenant, err := s.authStore.Authenticate(r.Header.Get("Authorization"))
+			if err != nil {
+				s.log.Warn("auth_failed", map[string]any{
+					"request_id": reqID,
+					"remote":     r.RemoteAddr,
+				})
+				s.writeJSON(w, http.StatusUnauthorized,
+					errorResponse{Error: "unauthorized", RequestID: reqID})
+				return
+			}
+			// Store resolved tenant in context for downstream handlers.
+			r = r.WithContext(auth.WithTenant(r.Context(), tenant))
+			tenantID = tenant.ID
+		}
+
+		// 3. Log request start (after auth so tenant_id is known).
 		s.log.Info("request_started", map[string]any{
 			"request_id": reqID,
 			"method":     r.Method,
 			"path":       r.URL.Path,
 			"remote":     r.RemoteAddr,
+			"tenant_id":  tenantID,
 		})
 
-		// Wrap ResponseWriter to capture status code for logging.
+		// 4. Delegate to handler, capture status for logging.
 		rw := &responseWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rw, r)
 
@@ -97,6 +115,7 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 			"path":        r.URL.Path,
 			"status":      rw.status,
 			"duration_ms": time.Since(start).Milliseconds(),
+			"tenant_id":   tenantID,
 		})
 	})
 }
@@ -109,23 +128,22 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleComplete processes POST /v1/complete.
 //
-// Flow:
-//  1. Enforce body size limit (MaxBytesReader) — reject 413 before any parsing.
-//  2. Decode JSON prompt from request body.
-//  3. Forward prompt to mock LLM.
-//  4. Return mock LLM response to client.
+// Flow (Phase 2):
+//  1. Enforce body size limit — reject 413 before any parsing.
+//  2. Decode JSON prompt.
+//  3. Run input guardrail scan — block or tag based on composite risk score.
+//  4. Forward to mock LLM.
+//  5. Return response.
 func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromCtx(r.Context())
+	tenant, _ := auth.TenantFromCtx(r.Context())
 
 	if r.Method != http.MethodPost {
 		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", reqID)
 		return
 	}
 
-	// --- Step 1: Enforce body size limit before reading any bytes ---
-	// MaxBytesReader wraps the body so that reading beyond MaxBodyBytes
-	// returns an error immediately. This prevents large payloads from being
-	// fully read into memory before we can reject them.
+	// --- Step 1: Enforce body size limit ---
 	if r.ContentLength > s.cfg.MaxBodyBytes {
 		s.log.Warn("request_body_too_large", map[string]any{
 			"request_id":     reqID,
@@ -148,9 +166,42 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Step 3: Forward to mock LLM ---
+	// --- Step 3: Input guardrail scan ---
+	result := s.scanner.Scan(r.Context(), req.Prompt)
+	s.log.Info("guardrail_scan", map[string]any{
+		"request_id":  reqID,
+		"tenant_id":   tenant.ID,
+		"score":       result.Score,
+		"verdict":     string(result.Verdict),
+		"signals":     result.Signals,
+	})
+
+	if result.Verdict == input.VerdictBlock {
+		s.log.Warn("guardrail_blocked", map[string]any{
+			"request_id": reqID,
+			"tenant_id":  tenant.ID,
+			"score":      result.Score,
+		})
+		s.writeJSON(w, http.StatusForbidden, map[string]any{
+			"error":      "guardrail_block",
+			"reason":     "Request blocked by input safety policy",
+			"score":      result.Score,
+			"request_id": reqID,
+		})
+		return
+	}
+
+	// VerdictTag: allow through but the scan log above already records it.
+	// Future phases can route tagged requests to a review queue.
+
+	// --- Step 4: Forward to mock LLM ---
 	llmResp, err := s.callMockLLM(r.Context(), reqID, req.Prompt)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			s.log.Error("mock_llm_timeout", map[string]any{"request_id": reqID})
+			s.writeError(w, http.StatusGatewayTimeout, "provider_timeout", reqID)
+			return
+		}
 		s.log.Error("mock_llm_error", map[string]any{
 			"request_id": reqID,
 			"error":      err.Error(),
@@ -159,7 +210,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Step 4: Return response ---
+	// --- Step 5: Return response ---
 	s.writeJSON(w, http.StatusOK, CompletionResponse{
 		RequestID: reqID,
 		Response:  llmResp,

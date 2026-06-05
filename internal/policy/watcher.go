@@ -10,12 +10,14 @@
 package policy
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
 
+	"github.com/abhijeetw035/llm-guardrail-gateway/internal/cache"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/logger"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/policy/dsl"
 )
@@ -34,8 +36,9 @@ func (b *Bundle) Evaluate(ctx dsl.EvalContext) dsl.Verdict {
 // Watcher loads a policy file, compiles it, and recompiles on every file change.
 // The active bundle is always available through Bundle() with no lock held by callers.
 type Watcher struct {
-	path string
-	log  *logger.Logger
+	path        string
+	log         *logger.Logger
+	policyCache *cache.PolicyCache // optional; nil disables cache publishing
 
 	mu     sync.RWMutex
 	bundle *Bundle // protected by mu
@@ -45,18 +48,21 @@ type Watcher struct {
 
 // NewWatcher creates a Watcher for the given policy file path and compiles the
 // initial bundle. Returns an error if the file cannot be read or compiled.
-func NewWatcher(path string, log *logger.Logger) (*Watcher, error) {
+// policyCache may be nil — in that case cache publishing is skipped.
+func NewWatcher(path string, log *logger.Logger, policyCache *cache.PolicyCache) (*Watcher, error) {
 	w := &Watcher{
-		path: path,
-		log:  log,
-		done: make(chan struct{}),
+		path:        path,
+		log:         log,
+		policyCache: policyCache,
+		done:        make(chan struct{}),
 	}
 
-	b, err := w.load()
+	b, src, err := w.load()
 	if err != nil {
 		return nil, fmt.Errorf("initial policy load: %w", err)
 	}
 	w.bundle = b
+	w.publishToCache(src, b)
 
 	go w.watch()
 	return w, nil
@@ -77,23 +83,44 @@ func (w *Watcher) Close() {
 }
 
 // load reads the policy file, lexes, parses, and compiles it.
-func (w *Watcher) load() (*Bundle, error) {
+// Returns the compiled bundle and the raw source string.
+func (w *Watcher) load() (*Bundle, string, error) {
 	src, err := os.ReadFile(w.path)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", w.path, err)
+		return nil, "", fmt.Errorf("read %s: %w", w.path, err)
 	}
 
 	ast, err := dsl.Parse(string(src))
 	if err != nil {
-		return nil, fmt.Errorf("parse: %w", err)
+		return nil, "", fmt.Errorf("parse: %w", err)
 	}
 
 	rules, err := dsl.Compile(ast)
 	if err != nil {
-		return nil, fmt.Errorf("compile: %w", err)
+		return nil, "", fmt.Errorf("compile: %w", err)
 	}
 
-	return &Bundle{TenantID: ast.TenantID, Rules: rules}, nil
+	return &Bundle{TenantID: ast.TenantID, Rules: rules}, string(src), nil
+}
+
+// publishToCache writes the compiled bundle to the policy cache if one is configured.
+// Errors are logged and ignored — the cache is best-effort.
+func (w *Watcher) publishToCache(src string, b *Bundle) {
+	if w.policyCache == nil {
+		return
+	}
+	ctx := context.Background()
+	if err := w.policyCache.Set(ctx, b.TenantID, src, b.Rules); err != nil {
+		w.log.Error("policy_cache_publish_failed", map[string]any{
+			"tenant_id": b.TenantID,
+			"error":     err.Error(),
+		})
+	} else {
+		w.log.Info("policy_cache_published", map[string]any{
+			"tenant_id": b.TenantID,
+			"rules":     len(b.Rules),
+		})
+	}
 }
 
 // watch runs fsnotify in a background goroutine and recompiles on Write events.
@@ -124,8 +151,8 @@ func (w *Watcher) watch() {
 			if !ok {
 				return
 			}
-			// Only recompile on write events (also catches rename/create for editors
-			// that save atomically by writing to a temp file then renaming).
+			// Recompile on write events. Also catches rename/create for editors
+			// that save atomically by writing a temp file then renaming.
 			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
 				w.reload()
 			}
@@ -142,7 +169,7 @@ func (w *Watcher) watch() {
 // reload compiles a new bundle and atomically swaps it in.
 // If compilation fails, the old bundle remains active and the error is logged.
 func (w *Watcher) reload() {
-	b, err := w.load()
+	b, src, err := w.load()
 	if err != nil {
 		// Compilation failure: keep old bundle. Log the error so the operator
 		// can fix the syntax without the gateway dropping to no-policy state.
@@ -162,4 +189,6 @@ func (w *Watcher) reload() {
 		"tenant_id": b.TenantID,
 		"rules":     len(b.Rules),
 	})
+
+	w.publishToCache(src, b)
 }

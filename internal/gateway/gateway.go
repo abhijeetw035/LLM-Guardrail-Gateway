@@ -15,11 +15,14 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/auth"
+	"github.com/abhijeetw035/llm-guardrail-gateway/internal/cache"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/config"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/guardrails/input"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/logger"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/policy"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/policy/dsl"
+	"github.com/abhijeetw035/llm-guardrail-gateway/internal/ratelimit"
+	"github.com/abhijeetw035/llm-guardrail-gateway/internal/redisclient"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/streaming"
 )
 
@@ -42,13 +45,16 @@ type errorResponse struct {
 
 // Server wraps the HTTP mux and shared dependencies.
 type Server struct {
-	cfg       config.Config
-	log       *logger.Logger
-	client    *http.Client
-	mux       *http.ServeMux
-	authStore *auth.Store
-	scanner   *input.Scanner
-	policy    *policy.Watcher // nil if no policy file configured
+	cfg         config.Config
+	log         *logger.Logger
+	client      *http.Client
+	mux         *http.ServeMux
+	authStore   *auth.Store
+	scanner     *input.Scanner
+	policy      *policy.Watcher    // nil when no policy file configured
+	limiter     *ratelimit.Limiter  // nil when Redis not configured
+	quota       *ratelimit.QuotaCounter // nil when Redis not configured
+	policyCache *cache.PolicyCache  // nil when Redis not configured
 }
 
 // New creates a Server and registers all routes.
@@ -62,14 +68,30 @@ func New(cfg config.Config, log *logger.Logger) *Server {
 		scanner:   input.NewScanner(),
 	}
 
+	// Initialise Redis-backed features when RedisAddr is set.
+	if cfg.RedisAddr != "" {
+		rdb, err := redisclient.New(cfg.RedisAddr, cfg.RedisPassword, 0)
+		if err != nil {
+			log.Error("redis_connect_failed", map[string]any{
+				"addr":  cfg.RedisAddr,
+				"error": err.Error(),
+			})
+			// Non-fatal: gateway starts without rate limiting and caching.
+		} else {
+			log.Info("redis_connected", map[string]any{"addr": cfg.RedisAddr})
+			s.limiter     = ratelimit.NewLimiter(rdb, cfg.RateLimitPerMinute, time.Minute)
+			s.quota       = ratelimit.NewQuotaCounter(rdb, cfg.DailyTokenQuota)
+			s.policyCache = cache.NewPolicyCache(rdb)
+		}
+	}
+
 	if cfg.PolicyFile != "" {
-		w, err := policy.NewWatcher(cfg.PolicyFile, log)
+		w, err := policy.NewWatcher(cfg.PolicyFile, log, s.policyCache)
 		if err != nil {
 			log.Error("policy_load_failed", map[string]any{
 				"path":  cfg.PolicyFile,
 				"error": err.Error(),
 			})
-			// Non-fatal: gateway starts without policy enforcement.
 		} else {
 			s.policy = w
 		}
@@ -113,6 +135,55 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 			// Store resolved tenant in context for downstream handlers.
 			r = r.WithContext(auth.WithTenant(r.Context(), tenant))
 			tenantID = tenant.ID
+
+			// Rate limit check — per-tenant sliding window.
+			if s.limiter != nil {
+				allowed, remaining, err := s.limiter.Allow(r.Context(), tenantID)
+				if err != nil {
+					s.log.Error("rate_limit_error", map[string]any{
+						"request_id": reqID,
+						"tenant_id":  tenantID,
+						"error":      err.Error(),
+					})
+					// On Redis error: fail open (allow the request through).
+				} else if !allowed {
+					s.log.Warn("rate_limited", map[string]any{
+						"request_id": reqID,
+						"tenant_id":  tenantID,
+					})
+					w.Header().Set("Retry-After", "60")
+					s.writeJSON(w, http.StatusTooManyRequests, map[string]any{
+						"error":      "rate_limit_exceeded",
+						"request_id": reqID,
+					})
+					return
+				} else {
+					w.Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
+				}
+			}
+
+			// Daily token quota check.
+			if s.quota != nil {
+				_, underLimit, err := s.quota.Check(r.Context(), tenantID)
+				if err != nil {
+					s.log.Error("quota_check_error", map[string]any{
+						"request_id": reqID,
+						"tenant_id":  tenantID,
+						"error":      err.Error(),
+					})
+					// On Redis error: fail open.
+				} else if !underLimit {
+					s.log.Warn("quota_exceeded", map[string]any{
+						"request_id": reqID,
+						"tenant_id":  tenantID,
+					})
+					s.writeJSON(w, http.StatusTooManyRequests, map[string]any{
+						"error":      "daily_quota_exceeded",
+						"request_id": reqID,
+					})
+					return
+				}
+			}
 		}
 
 		// 3. Log request start (after auth so tenant_id is known).
@@ -213,7 +284,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 	// VerdictTag: allow through but the scan log above already records it.
 
 	// --- Policy engine evaluation ---
-	if verdict := s.evalPolicy(tenant.ID, result.Score, "mock-llm-v1"); verdict.Matched && verdict.Action == dsl.ActionBlock {
+	if verdict := s.evalPolicy(r.Context(), tenant.ID, result.Score, "mock-llm-v1"); verdict.Matched && verdict.Action == dsl.ActionBlock {
 		s.log.Warn("policy_blocked", map[string]any{
 			"request_id": reqID,
 			"tenant_id":  tenant.ID,
@@ -250,6 +321,21 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		RequestID: reqID,
 		Response:  llmResp,
 	})
+
+	// Track token usage. Rough estimate: 1 token ≈ 4 characters.
+	// This is approximate but consistent — all LLM providers use similar heuristics.
+	if s.quota != nil {
+		tokens := int64((len(req.Prompt) + len(llmResp)) / 4)
+		if tokens < 1 {
+			tokens = 1
+		}
+		if _, _, err := s.quota.Add(r.Context(), tenant.ID, tokens); err != nil {
+			s.log.Error("quota_add_error", map[string]any{
+				"request_id": reqID,
+				"error":      err.Error(),
+			})
+		}
+	}
 }
 
 // handleStream processes POST /v1/stream.
@@ -305,7 +391,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// --- Policy engine evaluation ---
-	if verdict := s.evalPolicy(tenant.ID, scanResult.Score, "mock-llm-v1"); verdict.Matched && verdict.Action == dsl.ActionBlock {
+	if verdict := s.evalPolicy(r.Context(), tenant.ID, scanResult.Score, "mock-llm-v1"); verdict.Matched && verdict.Action == dsl.ActionBlock {
 		s.log.Warn("policy_blocked", map[string]any{
 			"request_id": reqID,
 			"tenant_id":  tenant.ID,
@@ -419,16 +505,21 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 }
 
 // evalPolicy builds the context and evaluates the compiled policy bundle.
-func (s *Server) evalPolicy(tenantID string, inputRiskScore float64, reqModel string) dsl.Verdict {
+func (s *Server) evalPolicy(ctx context.Context, tenantID string, inputRiskScore float64, reqModel string) dsl.Verdict {
 	if s.policy == nil {
 		return dsl.Verdict{}
 	}
 
-	// have to fetched from Redis.
-	// for now we mock it to a value below the quota block threshold (100k).
-	dailyTokens := 5000.0
+	// Read the real daily token count from Redis when available.
+	var dailyTokens float64
+	if s.quota != nil {
+		total, err := s.quota.Total(ctx, tenantID)
+		if err == nil {
+			dailyTokens = float64(total)
+		}
+	}
 
-	ctx := dsl.EvalContext{
+	evalCtx := dsl.EvalContext{
 		InputRiskScore:    inputRiskScore,
 		RequestModel:      reqModel,
 		TenantDailyTokens: dailyTokens,
@@ -436,12 +527,10 @@ func (s *Server) evalPolicy(tenantID string, inputRiskScore float64, reqModel st
 
 	b := s.policy.Bundle()
 	if b == nil || b.TenantID != tenantID {
-		// Either no policy loaded, or policy is for a different tenant.
-		// (Afterwards we will load per-tenant policies. Currently this assumes one global policy file).
 		return dsl.Verdict{}
 	}
 
-	return b.Evaluate(ctx)
+	return b.Evaluate(evalCtx)
 }
 
 // mockLLMRequest is the payload sent to the mock LLM server.

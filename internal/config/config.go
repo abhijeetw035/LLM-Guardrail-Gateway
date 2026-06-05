@@ -21,6 +21,11 @@ type Config struct {
 
 	// LogLevel controls minimum log verbosity ("info", "warn", "error").
 	LogLevel string
+
+	// WindowSize is the number of bytes the sliding window buffer holds before
+	// forwarding a prefix to the client. Larger = more safety latency.
+	// Default 512 bytes (~a few sentences).
+	WindowSize int
 }
 
 // Load reads config from environment variables, applying defaults where unset.
@@ -28,10 +33,12 @@ func Load() Config {
 	return Config{
 		ListenAddr:   getEnv("GATEWAY_LISTEN_ADDR", ":8080"),
 		MockLLMAddr:  getEnv("MOCK_LLM_ADDR", "http://localhost:9090"),
-		MaxBodyBytes: getEnvInt64("GATEWAY_MAX_BODY_BYTES", 512*1024), // 512 KB
+		MaxBodyBytes: getEnvInt64("GATEWAY_MAX_BODY_BYTES", 512*1024),
 		LogLevel:     getEnv("GATEWAY_LOG_LEVEL", "info"),
+		WindowSize:   getEnvInt("GATEWAY_WINDOW_SIZE", 512),
 	}
 }
+
 
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -43,6 +50,15 @@ func getEnv(key, fallback string) string {
 func getEnvInt64(key string, fallback int64) int64 {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
 	}

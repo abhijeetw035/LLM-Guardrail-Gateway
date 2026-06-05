@@ -18,6 +18,7 @@ import (
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/config"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/guardrails/input"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/logger"
+	"github.com/abhijeetw035/llm-guardrail-gateway/internal/streaming"
 )
 
 // CompletionRequest is the JSON body the client sends to the gateway.
@@ -58,6 +59,7 @@ func New(cfg config.Config, log *logger.Logger) *Server {
 		scanner:   input.NewScanner(),
 	}
 	s.mux.HandleFunc("/v1/complete", s.handleComplete)
+	s.mux.HandleFunc("/v1/stream", s.handleStream)
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 	return s
 }
@@ -212,6 +214,156 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, CompletionResponse{
 		RequestID: reqID,
 		Response:  llmResp,
+	})
+}
+
+// handleStream processes POST /v1/stream.
+//
+// It forwards the prompt to the mock LLM's SSE stream endpoint and pipes
+// the response through the sliding window buffer. The window holds N bytes
+// before forwarding so the output scanner always has lookahead — unsafe
+// content is detected before it reaches the client.
+func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+	reqID := requestIDFromCtx(r.Context())
+	tenant, _ := auth.TenantFromCtx(r.Context())
+
+	if r.Method != http.MethodPost {
+		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", reqID)
+		return
+	}
+
+	// Body size guard.
+	if r.ContentLength > s.cfg.MaxBodyBytes {
+		s.writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", reqID)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
+
+	// Decode prompt.
+	var req CompletionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_request_body", reqID)
+		return
+	}
+	if req.Prompt == "" {
+		s.writeError(w, http.StatusBadRequest, "prompt_required", reqID)
+		return
+	}
+
+	// Input guardrail scan (same as /v1/complete).
+	scanResult := s.scanner.Scan(r.Context(), req.Prompt)
+	s.log.Info("guardrail_scan", map[string]any{
+		"request_id": reqID,
+		"tenant_id":  tenant.ID,
+		"score":      scanResult.Score,
+		"verdict":    string(scanResult.Verdict),
+	})
+	if scanResult.Verdict == input.VerdictBlock {
+		s.log.Warn("guardrail_blocked", map[string]any{"request_id": reqID, "score": scanResult.Score})
+		s.writeJSON(w, http.StatusForbidden, map[string]any{
+			"error":      "guardrail_block",
+			"reason":     "Request blocked by input safety policy",
+			"score":      scanResult.Score,
+			"request_id": reqID,
+		})
+		return
+	}
+
+	// Call mock LLM stream endpoint.
+	body, _ := json.Marshal(mockLLMRequest{Prompt: req.Prompt})
+	llmReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
+		s.cfg.MockLLMAddr+"/stream", bytes.NewReader(body))
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "internal_error", reqID)
+		return
+	}
+	llmReq.Header.Set("Content-Type", "application/json")
+
+	llmResp, err := s.client.Do(llmReq)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			s.writeError(w, http.StatusGatewayTimeout, "provider_timeout", reqID)
+			return
+		}
+		s.log.Error("stream_llm_error", map[string]any{"request_id": reqID, "error": err.Error()})
+		s.writeError(w, http.StatusBadGateway, "provider_error", reqID)
+		return
+	}
+	defer llmResp.Body.Close()
+
+	// Set SSE response headers before writing the first byte.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Request-ID", reqID)
+	w.WriteHeader(http.StatusOK)
+	flusher, canFlush := w.(http.Flusher)
+
+	win := streaming.NewWindow(s.cfg.WindowSize)
+	start := time.Now()
+	aborted := false
+
+	// Read SSE chunks from mock LLM, push each into the window, forward safe prefix.
+	err = streaming.ReadSSEChunks(llmResp.Body, func(data []byte) bool {
+		// Write chunk into the window buffer.
+		win.Write(data)
+
+		// Scan and forward the safe prefix.
+		result, werr := win.Flush(w)
+		if werr != nil {
+			return false // client write error, stop
+		}
+		if result == streaming.ScanAbort {
+			aborted = true
+			return false
+		}
+		if canFlush {
+			flusher.Flush()
+		}
+		return true
+	})
+
+	if aborted {
+		// The output scanner detected unsafe content. Write an SSE error sentinel
+		// so the client knows the stream was terminated by policy.
+		// No unsafe bytes have been forwarded — the window held them.
+		s.log.Warn("stream_aborted_unsafe_output", map[string]any{
+			"request_id":  reqID,
+			"tenant_id":   tenant.ID,
+			"duration_ms": time.Since(start).Milliseconds(),
+		})
+		fmt.Fprintf(w, "data: {\"error\":\"output_policy_violation\",\"request_id\":%q}\n\n", reqID)
+		if canFlush {
+			flusher.Flush()
+		}
+		return
+	}
+
+	if err != nil {
+		s.log.Error("stream_read_error", map[string]any{"request_id": reqID, "error": err.Error()})
+		return
+	}
+
+	// Drain whatever is still in the window buffer after the stream ends.
+	result, _ := win.DrainSafe(w)
+	if result == streaming.ScanAbort {
+		s.log.Warn("stream_aborted_unsafe_output_drain", map[string]any{"request_id": reqID})
+		fmt.Fprintf(w, "data: {\"error\":\"output_policy_violation\",\"request_id\":%q}\n\n", reqID)
+		if canFlush {
+			flusher.Flush()
+		}
+		return
+	}
+
+	// Send SSE done sentinel.
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	if canFlush {
+		flusher.Flush()
+	}
+
+	s.log.Info("stream_completed", map[string]any{
+		"request_id":  reqID,
+		"tenant_id":   tenant.ID,
+		"duration_ms": time.Since(start).Milliseconds(),
 	})
 }
 

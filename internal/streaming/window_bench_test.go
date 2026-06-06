@@ -58,7 +58,7 @@ func BenchmarkWindowAbort(b *testing.B) {
 
 // BenchmarkOutScanner benchmarks the raw regex scanner against different payload sizes.
 func BenchmarkOutScanner(b *testing.B) {
-	scanner := newOutScanner()
+	scanner := globalOutScanner
 
 	for _, size := range []int{128, 512, 2048, 8192} {
 		// Clean payload (worst case — all patterns checked, none match).

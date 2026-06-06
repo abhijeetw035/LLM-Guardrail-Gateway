@@ -43,7 +43,7 @@ func NewWindow(size int) *Window {
 	}
 	return &Window{
 		size:    size,
-		scanner: newOutScanner(),
+		scanner: globalOutScanner,
 	}
 }
 
@@ -83,11 +83,10 @@ func (w *Window) Flush(dst io.Writer) (ScanResult, error) {
 		return ScanOK, err
 	}
 
-	// Keep only the unforwarded tail in the buffer.
-	remaining := make([]byte, w.size)
-	copy(remaining, data[safe:])
-	w.buf.Reset()
-	w.buf.Write(remaining)
+	// Consume the forwarded bytes from the buffer.
+	// bytes.Buffer will automatically shift the remaining tail to the front
+	// when needed, avoiding slice allocations on every flush.
+	w.buf.Next(safe)
 
 	return ScanOK, nil
 }
@@ -123,7 +122,9 @@ type outScanner struct {
 	patterns []*regexp.Regexp
 }
 
-func newOutScanner() *outScanner {
+var globalOutScanner *outScanner
+
+func init() {
 	raw := []string{
 		// Email addresses
 		`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`,
@@ -147,7 +148,7 @@ func newOutScanner() *outScanner {
 	for _, p := range raw {
 		compiled = append(compiled, regexp.MustCompile(p))
 	}
-	return &outScanner{patterns: compiled}
+	globalOutScanner = &outScanner{patterns: compiled}
 }
 
 // containsUnsafe returns true if any pattern matches in data.

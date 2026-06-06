@@ -60,11 +60,11 @@ go run ./tests/load -rate 100 -duration 10s -workers 10
 
 | Benchmark | ops/sec | ns/op | allocs/op | B/op |
 |---|---|---|---|---|
-| BenchmarkLex | | | | |
-| BenchmarkParse | | | | |
-| BenchmarkCompile | | | | |
-| BenchmarkEvaluate | | | | |
-| BenchmarkEvaluateLargePolicy (100 rules) | | | | |
+| BenchmarkLex | 877,249 | 1,372 | 19 | 4,584 |
+| BenchmarkParse | 702,135 | 1,723 | 34 | 5,248 |
+| BenchmarkCompile | 601,276 | 2,019 | 41 | 5,824 |
+| BenchmarkEvaluate | 154,187,565 | 7.772 | 0 | 0 |
+| BenchmarkEvaluateLargePolicy (100 rules) | 5,650,279 | 212.4 | 0 | 0 |
 
 **Key insight**: `BenchmarkEvaluate` should show **0 allocs/op** because the compiled closures are pre-built — no AST traversal or parsing happens on the hot path.
 
@@ -72,25 +72,25 @@ go run ./tests/load -rate 100 -duration 10s -workers 10
 
 | Benchmark | ops/sec | ns/op | allocs/op | B/op |
 |---|---|---|---|---|
-| BenchmarkScanClean | | | | |
-| BenchmarkScanMalicious | | | | |
-| BenchmarkScanLargePrompt (4KB) | | | | |
+| BenchmarkScanClean | 66,823 | 16,901 | 20 | 2,136 |
+| BenchmarkScanMalicious | 43,345 | 28,762 | 41 | 5,601 |
+| BenchmarkScanLargePrompt (4KB) | 1,776 | 706,345 | 21 | 13,314 |
 
 ### Sliding Window
 
 | Benchmark | ops/sec | ns/op | allocs/op | B/op |
 |---|---|---|---|---|
-| BenchmarkWindowFlush/window_32 | | | | |
-| BenchmarkWindowFlush/window_64 | | | | |
-| BenchmarkWindowFlush/window_128 | | | | |
-| BenchmarkWindowFlush/window_256 | | | | |
-| BenchmarkWindowFlush/window_512 | | | | |
-| BenchmarkWindowFlush/window_1024 | | | | |
-| BenchmarkWindowAbort | | | | |
-| BenchmarkOutScanner/clean_128 | | | | |
-| BenchmarkOutScanner/clean_512 | | | | |
-| BenchmarkOutScanner/clean_2048 | | | | |
-| BenchmarkOutScanner/clean_8192 | | | | |
+| BenchmarkWindowFlush/window_32 | 1,653 | 725,157 | 452 | 78,550 |
+| BenchmarkWindowFlush/window_64 | 1,256 | 961,006 | 522 | 82,821 |
+| BenchmarkWindowFlush/window_128 | 846 | 1,417,513 | 522 | 87,723 |
+| BenchmarkWindowFlush/window_256 | 519 | 2,294,220 | 521 | 96,566 |
+| BenchmarkWindowFlush/window_512 | 301 | 3,964,685 | 518 | 112,712 |
+| BenchmarkWindowFlush/window_1024 | 171 | 7,009,241 | 511 | 139,124 |
+| BenchmarkWindowAbort | 42,025 | 28,648 | 443 | 62,954 |
+| BenchmarkOutScanner/clean_128 | 96,346 | 12,379 | 0 | 0 |
+| BenchmarkOutScanner/clean_512 | 22,386 | 49,955 | 0 | 1 |
+| BenchmarkOutScanner/clean_2048 | 5,829 | 202,954 | 0 | 6 |
+| BenchmarkOutScanner/clean_8192 | 1,369 | 859,914 | 0 | 33 |
 
 **Key question**: How does window size affect throughput? Larger windows = more data scanned per flush = higher ns/op, but better safety coverage.
 
@@ -105,14 +105,14 @@ go run ./tests/load -rate 100 -duration 10s -workers 10
 | Target Rate | 100 req/s |
 | Duration | 10s |
 | Workers | 10 |
-| Total Requests | |
-| Success | |
-| Errors | |
-| Throughput | req/s |
-| P50 Latency | |
-| P95 Latency | |
-| P99 Latency | |
-| Max Latency | |
+| Total Requests | 999 |
+| Success | 999 |
+| Errors | 0 |
+| Throughput | 99.4 req/s |
+| P50 Latency | 51.71ms |
+| P95 Latency | 52.24ms |
+| P99 Latency | 53.77ms |
+| Max Latency | 77.46ms |
 
 ---
 

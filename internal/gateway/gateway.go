@@ -10,15 +10,18 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/auth"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/cache"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/config"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/guardrails/input"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/logger"
+	"github.com/abhijeetw035/llm-guardrail-gateway/internal/metrics"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/policy"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/policy/dsl"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/ratelimit"
@@ -100,6 +103,7 @@ func New(cfg config.Config, log *logger.Logger) *Server {
 	s.mux.HandleFunc("/v1/complete", s.handleComplete)
 	s.mux.HandleFunc("/v1/stream", s.handleStream)
 	s.mux.HandleFunc("/healthz", s.handleHealth)
+	s.mux.Handle("/metrics", promhttp.Handler())
 	return s
 }
 
@@ -151,6 +155,7 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 						"request_id": reqID,
 						"tenant_id":  tenantID,
 					})
+					metrics.RateLimitHitsTotal.WithLabelValues(tenantID, "rate").Inc()
 					w.Header().Set("Retry-After", "60")
 					s.writeJSON(w, http.StatusTooManyRequests, map[string]any{
 						"error":      "rate_limit_exceeded",
@@ -177,6 +182,7 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 						"request_id": reqID,
 						"tenant_id":  tenantID,
 					})
+					metrics.RateLimitHitsTotal.WithLabelValues(tenantID, "quota").Inc()
 					s.writeJSON(w, http.StatusTooManyRequests, map[string]any{
 						"error":      "daily_quota_exceeded",
 						"request_id": reqID,
@@ -195,18 +201,29 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 			"tenant_id":  tenantID,
 		})
 
-		// 4. Delegate to handler, capture status for logging.
+		// 4. Delegate to handler, capture status for logging and metrics.
 		rw := &responseWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rw, r)
 
+		duration := time.Since(start)
 		s.log.Info("request_completed", map[string]any{
 			"request_id":  reqID,
 			"method":      r.Method,
 			"path":        r.URL.Path,
 			"status":      rw.status,
-			"duration_ms": time.Since(start).Milliseconds(),
+			"duration_ms": duration.Milliseconds(),
 			"tenant_id":   tenantID,
 		})
+
+		// Record Prometheus metrics for every completed request.
+		if r.URL.Path != "/metrics" && r.URL.Path != "/healthz" {
+			metrics.RequestsTotal.WithLabelValues(
+				tenantID,
+				strconv.Itoa(rw.status),
+				r.URL.Path,
+			).Inc()
+			metrics.RequestDuration.WithLabelValues(tenantID, r.URL.Path).Observe(duration.Seconds())
+		}
 	})
 }
 
@@ -272,6 +289,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 			"tenant_id":  tenant.ID,
 			"score":      result.Score,
 		})
+		metrics.GuardrailBlocksTotal.WithLabelValues(tenant.ID, "input").Inc()
 		s.writeJSON(w, http.StatusForbidden, map[string]any{
 			"error":      "guardrail_block",
 			"reason":     "Request blocked by input safety policy",
@@ -291,6 +309,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 			"rule":       verdict.RuleName,
 			"reason":     verdict.Reason,
 		})
+		metrics.PolicyEvaluationsTotal.WithLabelValues(tenant.ID, "block").Inc()
 		s.writeJSON(w, http.StatusForbidden, map[string]any{
 			"error":      "policy_block",
 			"rule":       verdict.RuleName,
@@ -381,6 +400,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	})
 	if scanResult.Verdict == input.VerdictBlock {
 		s.log.Warn("guardrail_blocked", map[string]any{"request_id": reqID, "score": scanResult.Score})
+		metrics.GuardrailBlocksTotal.WithLabelValues(tenant.ID, "input").Inc()
 		s.writeJSON(w, http.StatusForbidden, map[string]any{
 			"error":      "guardrail_block",
 			"reason":     "Request blocked by input safety policy",
@@ -398,6 +418,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			"rule":       verdict.RuleName,
 			"reason":     verdict.Reason,
 		})
+		metrics.PolicyEvaluationsTotal.WithLabelValues(tenant.ID, "block").Inc()
 		s.writeJSON(w, http.StatusForbidden, map[string]any{
 			"error":      "policy_block",
 			"rule":       verdict.RuleName,
@@ -464,6 +485,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 					"tenant_id":   tenant.ID,
 					"duration_ms": time.Since(start).Milliseconds(),
 				})
+				metrics.StreamAbortsTotal.WithLabelValues(tenant.ID).Inc()
 				fmt.Fprintf(w, "data: {\"error\":\"output_policy_violation\",\"request_id\":%q}\n\n", reqID)
 				if canFlush {
 					flusher.Flush()
@@ -487,6 +509,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	result, _ := win.DrainSafe(w)
 	if result == streaming.ScanAbort {
 		s.log.Warn("stream_aborted_unsafe_output_drain", map[string]any{"request_id": reqID})
+		metrics.StreamAbortsTotal.WithLabelValues(tenant.ID).Inc()
 		fmt.Fprintf(w, "data: {\"error\":\"output_policy_violation\",\"request_id\":%q}\n\n", reqID)
 		if canFlush {
 			flusher.Flush()

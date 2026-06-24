@@ -3,7 +3,6 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,6 +23,7 @@ import (
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/metrics"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/policy"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/policy/dsl"
+	"github.com/abhijeetw035/llm-guardrail-gateway/internal/provider"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/ratelimit"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/redisclient"
 	"github.com/abhijeetw035/llm-guardrail-gateway/internal/streaming"
@@ -50,14 +50,14 @@ type errorResponse struct {
 type Server struct {
 	cfg         config.Config
 	log         *logger.Logger
-	client      *http.Client
 	mux         *http.ServeMux
 	authStore   *auth.Store
 	scanner     *input.Scanner
-	policy      *policy.Watcher    // nil when no policy file configured
-	limiter     *ratelimit.Limiter  // nil when Redis not configured
+	policy      *policy.Watcher        // nil when no policy file configured
+	limiter     *ratelimit.Limiter      // nil when Redis not configured
 	quota       *ratelimit.QuotaCounter // nil when Redis not configured
-	policyCache *cache.PolicyCache  // nil when Redis not configured
+	policyCache *cache.PolicyCache      // nil when Redis not configured
+	llm         provider.Adapter        // pluggable LLM backend
 }
 
 // New creates a Server and registers all routes.
@@ -65,11 +65,20 @@ func New(cfg config.Config, log *logger.Logger) *Server {
 	s := &Server{
 		cfg:       cfg,
 		log:       log,
-		client:    &http.Client{Timeout: 30 * time.Second},
 		mux:       http.NewServeMux(),
 		authStore: auth.DefaultStore(),
 		scanner:   input.NewScanner(),
 	}
+
+	// Initialise the LLM provider adapter.
+	llmAdapter, err := provider.New(cfg)
+	if err != nil {
+		log.Error("provider_init_failed", map[string]any{"error": err.Error()})
+		// Fall back to mock so the gateway doesn't crash on startup.
+		llmAdapter = provider.NewMockAdapter(cfg.MockLLMAddr)
+	}
+	s.llm = llmAdapter
+	log.Info("provider_selected", map[string]any{"provider": cfg.LLMProvider})
 
 	// Initialise Redis-backed features when RedisAddr is set.
 	if cfg.RedisAddr != "" {
@@ -319,15 +328,15 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Forward to mock LLM ---
-	llmResp, err := s.callMockLLM(r.Context(), reqID, req.Prompt)
+	// --- Forward to LLM provider ---
+	provResult, err := s.llm.Generate(r.Context(), req.Prompt)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			s.log.Error("mock_llm_timeout", map[string]any{"request_id": reqID})
+			s.log.Error("provider_timeout", map[string]any{"request_id": reqID})
 			s.writeError(w, http.StatusGatewayTimeout, "provider_timeout", reqID)
 			return
 		}
-		s.log.Error("mock_llm_error", map[string]any{
+		s.log.Error("provider_error", map[string]any{
 			"request_id": reqID,
 			"error":      err.Error(),
 		})
@@ -335,16 +344,26 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.log.Info("provider_response_ok", map[string]any{
+		"request_id":    reqID,
+		"model":         provResult.Model,
+		"input_tokens":  provResult.InputTokens,
+		"output_tokens": provResult.OutputTokens,
+	})
+
 	// --- Return response ---
 	s.writeJSON(w, http.StatusOK, CompletionResponse{
 		RequestID: reqID,
-		Response:  llmResp,
+		Response:  provResult.Text,
 	})
 
-	// Track token usage. Rough estimate: 1 token ≈ 4 characters.
-	// This is approximate but consistent — all LLM providers use similar heuristics.
+	// Track token usage. Use real token counts when available (from provider),
+	// otherwise fall back to the 1-token-per-4-chars heuristic.
 	if s.quota != nil {
-		tokens := int64((len(req.Prompt) + len(llmResp)) / 4)
+		tokens := int64(provResult.InputTokens + provResult.OutputTokens)
+		if tokens < 1 {
+			tokens = int64((len(req.Prompt) + len(provResult.Text)) / 4)
+		}
 		if tokens < 1 {
 			tokens = 1
 		}
@@ -428,34 +447,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build mock LLM URL, forwarding any query params from the client request
-	// (e.g. ?unsafe=true used in testing to trigger the unsafe payload path).
-	streamURL := s.cfg.MockLLMAddr + "/stream"
-	if q := r.URL.RawQuery; q != "" {
-		streamURL += "?" + q
-	}
-
-	body, _ := json.Marshal(mockLLMRequest{Prompt: req.Prompt})
-	llmReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, streamURL, bytes.NewReader(body))
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "internal_error", reqID)
-		return
-	}
-	llmReq.Header.Set("Content-Type", "application/json")
-
-	llmResp, err := s.client.Do(llmReq)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			s.writeError(w, http.StatusGatewayTimeout, "provider_timeout", reqID)
-			return
-		}
-		s.log.Error("stream_llm_error", map[string]any{"request_id": reqID, "error": err.Error()})
-		s.writeError(w, http.StatusBadGateway, "provider_error", reqID)
-		return
-	}
-	defer llmResp.Body.Close()
-
 	// Set SSE response headers before writing the first byte.
+	// We set these BEFORE calling StreamTo so that if the provider fails
+	// immediately, we can still return a proper HTTP error code.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Request-ID", reqID)
@@ -464,45 +458,38 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	win := streaming.NewWindow(s.cfg.WindowSize)
 	start := time.Now()
-	chunk := make([]byte, 256)
 
-	// Read raw SSE bytes from the mock LLM and push them through the window.
-	// Raw bytes include "data: word\n\n" — the window forwards them unchanged,
-	// so the client receives proper SSE format. The scanner sees the full text
-	// (including any PII embedded in the payload) and can match across chunk
-	// boundaries because the window tail is never discarded until cleared.
-	for {
-		n, readErr := llmResp.Body.Read(chunk)
-		if n > 0 {
-			win.Write(chunk[:n])
-			result, werr := win.Flush(w)
-			if werr != nil {
-				break
-			}
-			if result == streaming.ScanAbort {
-				s.log.Warn("stream_aborted_unsafe_output", map[string]any{
-					"request_id":  reqID,
-					"tenant_id":   tenant.ID,
-					"duration_ms": time.Since(start).Milliseconds(),
-				})
-				metrics.StreamAbortsTotal.WithLabelValues(tenant.ID).Inc()
-				fmt.Fprintf(w, "data: {\"error\":\"output_policy_violation\",\"request_id\":%q}\n\n", reqID)
-				if canFlush {
-					flusher.Flush()
-				}
-				return
-			}
-			if canFlush {
-				flusher.Flush()
+	// winWriter wraps the sliding window flush+abort logic as an io.Writer.
+	// The provider adapter writes SSE bytes to this writer; we scan each chunk
+	// through the window before forwarding safe prefixes to the HTTP client.
+	winWriter := &windowWriter{
+		win:      win,
+		dst:      w,
+		flusher:  flusher,
+		canFlush: canFlush,
+		reqID:    reqID,
+		tenantID: tenant.ID,
+		log:      s.log,
+	}
+
+	if err := s.llm.StreamTo(r.Context(), req.Prompt, winWriter); err != nil {
+		if !winWriter.aborted {
+			if errors.Is(err, context.DeadlineExceeded) {
+				s.log.Error("stream_provider_timeout", map[string]any{"request_id": reqID})
+			} else {
+				s.log.Error("stream_provider_error", map[string]any{"request_id": reqID, "error": err.Error()})
 			}
 		}
-		if readErr == io.EOF {
-			break
+		return
+	}
+
+	if winWriter.aborted {
+		metrics.StreamAbortsTotal.WithLabelValues(tenant.ID).Inc()
+		fmt.Fprintf(w, "data: {\"error\":\"output_policy_violation\",\"request_id\":%q}\n\n", reqID)
+		if canFlush {
+			flusher.Flush()
 		}
-		if readErr != nil {
-			s.log.Error("stream_read_error", map[string]any{"request_id": reqID, "error": readErr.Error()})
-			return
-		}
+		return
 	}
 
 	// Drain the remaining window buffer after the stream ends.
@@ -556,58 +543,42 @@ func (s *Server) evalPolicy(ctx context.Context, tenantID string, inputRiskScore
 	return b.Evaluate(evalCtx)
 }
 
-// mockLLMRequest is the payload sent to the mock LLM server.
-type mockLLMRequest struct {
-	Prompt string `json:"prompt"`
+// windowWriter is an io.Writer that feeds bytes from the LLM provider through
+// the sliding window scanner. It is used by handleStream to connect the
+// provider.Adapter.StreamTo call to the safety scanning layer.
+type windowWriter struct {
+	win      *streaming.Window
+	dst      io.Writer
+	flusher  http.Flusher
+	canFlush bool
+	reqID    string
+	tenantID string
+	log      *logger.Logger
+	aborted  bool
 }
 
-// mockLLMResponse is what the mock LLM server returns.
-type mockLLMResponse struct {
-	Response    string `json:"response"`
-	Model       string `json:"model"`
-	InputTokens int    `json:"input_tokens"`
-	OutTokens   int    `json:"output_tokens"`
-}
-
-// callMockLLM POSTs the prompt to the mock LLM and returns the response text.
-func (s *Server) callMockLLM(ctx context.Context, reqID, prompt string) (string, error) {
-	body, err := json.Marshal(mockLLMRequest{Prompt: prompt})
+func (ww *windowWriter) Write(p []byte) (int, error) {
+	if ww.aborted {
+		// Once aborted, stop accepting bytes so the provider call returns.
+		return 0, fmt.Errorf("stream aborted: unsafe content detected")
+	}
+	ww.win.Write(p)
+	result, err := ww.win.Flush(ww.dst)
 	if err != nil {
-		return "", fmt.Errorf("marshal: %w", err)
+		return len(p), err
 	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		s.cfg.MockLLMAddr+"/generate", bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("build request: %w", err)
+	if result == streaming.ScanAbort {
+		ww.aborted = true
+		ww.log.Warn("stream_aborted_unsafe_output", map[string]any{
+			"request_id": ww.reqID,
+			"tenant_id":  ww.tenantID,
+		})
+		return 0, fmt.Errorf("stream aborted: unsafe content detected")
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	start := time.Now()
-	resp, err := s.client.Do(httpReq)
-	if err != nil {
-		return "", fmt.Errorf("do request: %w", err)
+	if ww.canFlush {
+		ww.flusher.Flush()
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("provider returned %d", resp.StatusCode)
-	}
-
-	var llmResp mockLLMResponse
-	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
-	}
-
-	s.log.Info("provider_response_ok", map[string]any{
-		"request_id":   reqID,
-		"model":        llmResp.Model,
-		"input_tokens": llmResp.InputTokens,
-		"output_tokens": llmResp.OutTokens,
-		"duration_ms":  time.Since(start).Milliseconds(),
-	})
-
-	return llmResp.Response, nil
+	return len(p), nil
 }
 
 // writeJSON encodes v as JSON and writes it with the given status code.

@@ -13,6 +13,7 @@ type Config struct {
 	ListenAddr string
 
 	// MockLLMAddr is the base URL of the mock LLM server.
+	// Only used when LLMProvider is "mock" (the default).
 	MockLLMAddr string
 
 	// MaxBodyBytes is the hard cap on request body size (default 512 KB).
@@ -43,6 +44,25 @@ type Config struct {
 
 	// DailyTokenQuota is the maximum tokens a tenant may consume in one UTC day.
 	DailyTokenQuota int64
+
+	// --- Provider Adapter settings ---
+
+	// LLMProvider selects the LLM backend to use.
+	// Valid values: "mock" (default), "groq", "gemini", "openai", "custom".
+	LLMProvider string
+
+	// LLMAPIKey is the API key / bearer token for the chosen provider.
+	// Not required when LLMProvider is "mock".
+	LLMAPIKey string
+
+	// LLMModel overrides the default model for the chosen provider.
+	// Leave empty to use the provider's recommended default.
+	LLMModel string
+
+	// LLMBaseURL overrides the API base URL for the chosen provider.
+	// Required when LLMProvider is "custom"; ignored for known providers
+	// unless you need to point at a different region or self-hosted endpoint.
+	LLMBaseURL string
 }
 
 // Load reads config from environment variables, applying defaults where unset.
@@ -58,6 +78,11 @@ func Load() Config {
 		RedisPassword:      getEnv("REDIS_PASSWORD", ""),
 		RateLimitPerMinute: getEnvInt("RATE_LIMIT_PER_MINUTE", 60),
 		DailyTokenQuota:    getEnvInt64("DAILY_TOKEN_QUOTA", 100000),
+		// Provider adapter
+		LLMProvider: getEnv("LLM_PROVIDER", "mock"),
+		LLMAPIKey:   getEnv("LLM_API_KEY", ""),
+		LLMModel:    getEnv("LLM_MODEL", ""),
+		LLMBaseURL:  getEnv("LLM_BASE_URL", ""),
 	}
 }
 

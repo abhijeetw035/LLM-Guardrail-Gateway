@@ -34,6 +34,24 @@ services:
       RATE_LIMIT_PER_MINUTE: "60"
       DAILY_TOKEN_QUOTA: "100000"
       GATEWAY_POLICY_FILE: "configs/dev.policy"
+      # --- LLM Provider (default: mock) ---
+      # To use a real LLM, set LLM_PROVIDER and LLM_API_KEY below.
+      # The mockllm service can be removed from depends_on when using a real provider.
+      #
+      # Groq (free tier, fast):
+      # LLM_PROVIDER: "groq"
+      # LLM_API_KEY: "gsk_your_groq_key_here"
+      # LLM_MODEL: "llama-3.3-70b-versatile"   # optional, this is the default
+      #
+      # Google Gemini:
+      # LLM_PROVIDER: "gemini"
+      # LLM_API_KEY: "your_google_ai_api_key"
+      # LLM_MODEL: "gemini-2.0-flash"           # optional, this is the default
+      #
+      # OpenAI:
+      # LLM_PROVIDER: "openai"
+      # LLM_API_KEY: "sk-your_openai_key"
+      # LLM_MODEL: "gpt-4o-mini"                # optional, this is the default
     depends_on:
       redis:
         condition: service_healthy
@@ -41,6 +59,7 @@ services:
         condition: service_started
     volumes:
       - ./configs:/app/configs
+
 
   prometheus:
     image: prom/prometheus:latest

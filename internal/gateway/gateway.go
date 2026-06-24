@@ -132,9 +132,9 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 		r = r.WithContext(ctx)
 		w.Header().Set("X-Request-ID", reqID)
 
-		// 2. Authenticate — /healthz is exempt.
+		// 2. Authenticate — /healthz and /metrics are exempt.
 		var tenantID string
-		if r.URL.Path != "/healthz" {
+		if r.URL.Path != "/healthz" && r.URL.Path != "/metrics" {
 			tenant, err := s.authStore.Authenticate(r.Header.Get("Authorization"))
 			if err != nil {
 				s.log.Warn("auth_failed", map[string]any{

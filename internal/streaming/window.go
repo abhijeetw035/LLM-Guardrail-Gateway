@@ -153,12 +153,34 @@ func init() {
 
 // containsUnsafe returns true if any pattern matches in data.
 func (s *outScanner) containsUnsafe(data []byte) bool {
+	cleanData := stripSSE(data)
 	for _, re := range s.patterns {
-		if re.Match(data) {
+		if re.Match(cleanData) {
 			return true
 		}
 	}
 	return false
+}
+
+// Previous Issue :
+// When used the Mock LLM, it streamed whole words (data: AKIAIOSFODNN7AX3KPFA \n\n).
+// But Groq streams subword tokens (data: AK, data: IA, data: IOS).
+
+// Because Sliding Window buffer holds the raw HTTP bytes (including the data: \n\n SSE protocol 
+// framing), the AWS key inside the buffer actually looked like this: data: AK\n\ndata: IA\n\ndata: IOS
+
+// Regex engine (\bAKIA...) failed to match because the word was broken up by the SSE headers!
+
+// SOLUTION : added a stripSSE() helper that cleans the protocol
+
+// stripSSE removes SSE protocol framing so regex patterns can match
+// across chunk boundaries (e.g. subword tokens from an LLM stream).
+func stripSSE(data []byte) []byte {
+	d := bytes.ReplaceAll(data, []byte("data: "), nil)
+	d = bytes.ReplaceAll(d, []byte("\n"), nil)
+	d = bytes.ReplaceAll(d, []byte("\r"), nil)
+	d = bytes.ReplaceAll(d, []byte("[DONE]"), nil)
+	return d
 }
 
 // --- SSE helpers ---

@@ -497,6 +497,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	if winWriter.aborted {
 		metrics.StreamAbortsTotal.WithLabelValues(tenant.ID).Inc()
+		metrics.GuardrailBlocksTotal.WithLabelValues(tenant.ID, "output").Inc()
 		fmt.Fprintf(w, "data: {\"error\":\"output_policy_violation\",\"request_id\":%q}\n\n", reqID)
 		if canFlush {
 			flusher.Flush()
@@ -521,6 +522,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	if result == streaming.ScanAbort {
 		s.log.Warn("stream_aborted_unsafe_output_drain", map[string]any{"request_id": reqID})
 		metrics.StreamAbortsTotal.WithLabelValues(tenant.ID).Inc()
+		metrics.GuardrailBlocksTotal.WithLabelValues(tenant.ID, "output").Inc()
 		fmt.Fprintf(w, "data: {\"error\":\"output_policy_violation\",\"request_id\":%q}\n\n", reqID)
 		if canFlush {
 			flusher.Flush()

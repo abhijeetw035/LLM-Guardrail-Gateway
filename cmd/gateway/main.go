@@ -18,10 +18,11 @@ func main() {
 	log := logger.New(logger.Level(cfg.LogLevel))
 
 	log.Info("gateway_starting", map[string]any{
-		"listen_addr":   cfg.ListenAddr,
-		"mock_llm_addr": cfg.MockLLMAddr,
+		"listen_addr":    cfg.ListenAddr,
+		"llm_provider":   cfg.LLMProvider,
+		"mock_llm_addr":  cfg.MockLLMAddr,
 		"max_body_bytes": cfg.MaxBodyBytes,
-		"log_level":     cfg.LogLevel,
+		"log_level":      cfg.LogLevel,
 	})
 
 	srv := &http.Server{

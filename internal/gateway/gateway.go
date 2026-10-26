@@ -242,6 +242,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
+
+
+// This function is the main request handler for POST /v1/complete in gateway.go. 
+// It takes the user prompt, applies safety checks, forwards it to the model, 
+// and then records token usage.
+
 // handleComplete processes POST /v1/complete.
 //
 // Flow:
@@ -463,21 +469,27 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// The provider adapter writes SSE bytes to this writer; we scan each chunk
 	// through the window before forwarding safe prefixes to the HTTP client.
 	winWriter := &windowWriter{
-		win:      win,
-		dst:      w,
-		flusher:  flusher,
-		canFlush: canFlush,
-		reqID:    reqID,
-		tenantID: tenant.ID,
-		log:      s.log,
+		win:         win,
+		dst:         w,
+		flusher:     flusher,
+		canFlush:    canFlush,
+		reqID:       reqID,
+		tenantID:    tenant.ID,
+		log:         s.log,
+		streamStart: start,
 	}
 
 	if err := s.llm.StreamTo(r.Context(), req.Prompt, winWriter); err != nil {
 		if !winWriter.aborted {
 			if errors.Is(err, context.DeadlineExceeded) {
 				s.log.Error("stream_provider_timeout", map[string]any{"request_id": reqID})
+				fmt.Fprintf(w, "data: {\"error\":\"provider_timeout\",\"request_id\":%q}\n\n", reqID)
 			} else {
 				s.log.Error("stream_provider_error", map[string]any{"request_id": reqID, "error": err.Error()})
+				fmt.Fprintf(w, "data: {\"error\":\"provider_error\",\"message\":%q,\"request_id\":%q}\n\n", err.Error(), reqID)
+			}
+			if canFlush {
+				flusher.Flush()
 			}
 		}
 		return
@@ -493,7 +505,19 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Drain the remaining window buffer after the stream ends.
-	result, _ := win.DrainSafe(w)
+	drainCheckStart := time.Now()
+	cw := &countWriter{dst: w}
+	result, _ := win.DrainSafe(cw)
+	drainDuration := time.Since(drainCheckStart)
+	winWriter.totalCheckTime += drainDuration
+	metrics.StreamCheckDurationSeconds.WithLabelValues(tenant.ID).Observe(drainDuration.Seconds())
+
+	if cw.written > 0 && winWriter.firstChunkSentAt.IsZero() {
+		now := time.Now()
+		winWriter.firstChunkSentAt = now
+		metrics.StreamTTFTSeconds.WithLabelValues(tenant.ID).Observe(now.Sub(winWriter.streamStart).Seconds())
+	}
+
 	if result == streaming.ScanAbort {
 		s.log.Warn("stream_aborted_unsafe_output_drain", map[string]any{"request_id": reqID})
 		metrics.StreamAbortsTotal.WithLabelValues(tenant.ID).Inc()
@@ -507,10 +531,28 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
+	var avgCheckUs int64
+	var avgInterChunkMs int64
+	if winWriter.chunksSentCount > 0 {
+		avgInterChunkMs = (winWriter.totalInterChunk / time.Duration(winWriter.chunksSentCount)).Milliseconds()
+	}
+	totalChecks := winWriter.chunksSentCount + 1
+	if totalChecks > 0 {
+		avgCheckUs = (winWriter.totalCheckTime / time.Duration(totalChecks)).Microseconds()
+	}
+
+	var ttftMs int64
+	if !winWriter.firstChunkSentAt.IsZero() {
+		ttftMs = winWriter.firstChunkSentAt.Sub(winWriter.streamStart).Milliseconds()
+	}
+
 	s.log.Info("stream_completed", map[string]any{
-		"request_id":  reqID,
-		"tenant_id":   tenant.ID,
-		"duration_ms": time.Since(start).Milliseconds(),
+		"request_id":         reqID,
+		"tenant_id":          tenant.ID,
+		"duration_ms":        time.Since(start).Milliseconds(),
+		"ttft_ms":            ttftMs,
+		"avg_check_time_us":  avgCheckUs,
+		"avg_inter_chunk_ms": avgInterChunkMs,
 	})
 }
 
@@ -543,6 +585,18 @@ func (s *Server) evalPolicy(ctx context.Context, tenantID string, inputRiskScore
 	return b.Evaluate(evalCtx)
 }
 
+// countWriter wraps an io.Writer and counts bytes successfully written.
+type countWriter struct {
+	dst     io.Writer
+	written int
+}
+
+func (cw *countWriter) Write(p []byte) (int, error) {
+	n, err := cw.dst.Write(p)
+	cw.written += n
+	return n, err
+}
+
 // windowWriter is an io.Writer that feeds bytes from the LLM provider through
 // the sliding window scanner. It is used by handleStream to connect the
 // provider.Adapter.StreamTo call to the safety scanning layer.
@@ -555,6 +609,14 @@ type windowWriter struct {
 	tenantID string
 	log      *logger.Logger
 	aborted  bool
+
+	// Latency & scanner timing instrumentation
+	streamStart      time.Time
+	firstChunkSentAt time.Time
+	lastChunkSentAt  time.Time
+	totalCheckTime   time.Duration
+	chunksSentCount  int
+	totalInterChunk  time.Duration
 }
 
 func (ww *windowWriter) Write(p []byte) (int, error) {
@@ -563,7 +625,15 @@ func (ww *windowWriter) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("stream aborted: unsafe content detected")
 	}
 	ww.win.Write(p)
-	result, err := ww.win.Flush(ww.dst)
+
+	cw := &countWriter{dst: ww.dst}
+	checkStart := time.Now()
+	result, err := ww.win.Flush(cw)
+	checkDuration := time.Since(checkStart)
+
+	ww.totalCheckTime += checkDuration
+	metrics.StreamCheckDurationSeconds.WithLabelValues(ww.tenantID).Observe(checkDuration.Seconds())
+
 	if err != nil {
 		return len(p), err
 	}
@@ -575,8 +645,29 @@ func (ww *windowWriter) Write(p []byte) (int, error) {
 		})
 		return 0, fmt.Errorf("stream aborted: unsafe content detected")
 	}
-	if ww.canFlush {
-		ww.flusher.Flush()
+
+	if cw.written > 0 {
+		now := time.Now()
+		if ww.firstChunkSentAt.IsZero() {
+			ww.firstChunkSentAt = now
+			ttft := now.Sub(ww.streamStart)
+			metrics.StreamTTFTSeconds.WithLabelValues(ww.tenantID).Observe(ttft.Seconds())
+			ww.log.Info("stream_first_chunk_sent", map[string]any{
+				"request_id":       ww.reqID,
+				"ttft_overhead_ms": ttft.Milliseconds(),
+				"check_us":         checkDuration.Microseconds(),
+			})
+		} else {
+			interChunk := now.Sub(ww.lastChunkSentAt)
+			ww.totalInterChunk += interChunk
+			ww.chunksSentCount++
+			metrics.StreamInterChunkDurationSeconds.WithLabelValues(ww.tenantID).Observe(interChunk.Seconds())
+		}
+		ww.lastChunkSentAt = now
+
+		if ww.canFlush {
+			ww.flusher.Flush()
+		}
 	}
 	return len(p), nil
 }

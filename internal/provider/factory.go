@@ -9,7 +9,7 @@ import (
 
 // providerDefaults holds the default base URL and model for each supported provider.
 var providerDefaults = map[string]struct{ baseURL, model string }{
-	"groq":   {"https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"},
+	"groq":   {"https://api.groq.com/openai/v1", "openai/gpt-oss-20b"},
 	"gemini": {"https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-2.0-flash"},
 	"openai": {"https://api.openai.com/v1", "gpt-4o-mini"},
 }

@@ -67,7 +67,7 @@ func BenchmarkOutScanner(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(len(clean)))
 			for i := 0; i < b.N; i++ {
-				_ = scanner.containsUnsafe(clean)
+				_ = scanner.scanStream(clean)
 			}
 		})
 	}

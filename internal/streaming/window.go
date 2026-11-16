@@ -1,4 +1,4 @@
-// Package streaming implements the sliding window buffer and FSM output scanner.
+// Package streaming implements the sliding window buffer and regex output scanner.
 //
 // The core problem: once bytes are flushed to the HTTP client they cannot be
 // recalled. If we scan each chunk and immediately forward it, unsafe content
@@ -65,8 +65,8 @@ func (w *Window) Flush(dst io.Writer) (ScanResult, error) {
 		return ScanOK, nil
 	}
 
-	// Run the FSM scanner over the entire current buffer.
-	if w.scanner.containsUnsafe(data) {
+	// Run the output scanner over the entire current buffer.
+	if w.scanner.scanStream(data) {
 		return ScanAbort, nil
 	}
 
@@ -98,7 +98,7 @@ func (w *Window) DrainSafe(dst io.Writer) (ScanResult, error) {
 	if len(data) == 0 {
 		return ScanOK, nil
 	}
-	if w.scanner.containsUnsafe(data) {
+	if w.scanner.scanStream(data) {
 		return ScanAbort, nil
 	}
 	_, err := dst.Write(data)
@@ -106,14 +106,14 @@ func (w *Window) DrainSafe(dst io.Writer) (ScanResult, error) {
 	return ScanOK, err
 }
 
-// --- FSM output scanner ---
+// --- Regex output scanner ---
 //
 // Scans buffered bytes for patterns that should never reach a client:
 //   - PII: email addresses, phone numbers, SSNs, credit card numbers
 //   - Secrets: AWS keys, generic API key patterns
 //   - Unsafe content markers
 //
-// The FSM here is implemented as compiled regexes that run over the buffered
+// The scanner is a set of compiled regexes that run over the buffered
 // window. Because the buffer always contains the full unforwarded tail, a
 // pattern split across two SSE chunks is still detected correctly — the
 // dangerous bytes are never forwarded before the scan completes.
@@ -151,15 +151,28 @@ func init() {
 	globalOutScanner = &outScanner{patterns: compiled}
 }
 
-// containsUnsafe returns true if any pattern matches in data.
+// containsUnsafe returns true if any pattern matches data exactly as given.
+// No normalisation is applied, so newlines remain word boundaries.
 func (s *outScanner) containsUnsafe(data []byte) bool {
-	cleanData := stripSSE(data)
 	for _, re := range s.patterns {
-		if re.Match(cleanData) {
+		if re.Match(data) {
 			return true
 		}
 	}
 	return false
+}
+
+// scanStream scans raw SSE bytes under two views and reports true if either
+// matches:
+//   - joined: SSE framing and newlines removed, so a secret split across
+//     subword tokens ("AK", "IA", "OSFOD...") is reassembled.
+//   - spaced: framing removed but newlines turned into spaces, so a secret
+//     followed by another chunk is not glued to it (which would defeat \b).
+func (s *outScanner) scanStream(data []byte) bool {
+	if s.containsUnsafe(stripSSE(data)) {
+		return true
+	}
+	return s.containsUnsafe(spaceSSE(data))
 }
 
 // ContainsUnsafe reports whether text matches any output-policy pattern.
@@ -167,6 +180,14 @@ func (s *outScanner) containsUnsafe(data []byte) bool {
 // are held to the same rules as streamed ones.
 func ContainsUnsafe(text string) bool {
 	return globalOutScanner.containsUnsafe([]byte(text))
+}
+
+// spaceSSE removes SSE framing but replaces CR/LF with spaces.
+func spaceSSE(data []byte) []byte {
+	d := bytes.ReplaceAll(data, []byte("data: "), nil)
+	d = bytes.ReplaceAll(d, []byte("[DONE]"), nil)
+	d = bytes.ReplaceAll(d, []byte("\r"), []byte(" "))
+	return bytes.ReplaceAll(d, []byte("\n"), []byte(" "))
 }
 
 // Previous Issue :

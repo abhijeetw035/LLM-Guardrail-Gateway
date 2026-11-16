@@ -40,9 +40,9 @@ func NewStore(keys map[string]Tenant) *Store {
 // DefaultStore returns a hard-coded store suitable for local development.
 func DefaultStore() *Store {
 	return NewStore(map[string]Tenant{
-		"key-acme-1234":  {ID: "acme-corp", Name: "Acme Corp"},
-		"key-beta-5678":  {ID: "beta-inc", Name: "Beta Inc"},
-		"key-dev-local":  {ID: "dev", Name: "Local Dev"},
+		"key-acme-1234": {ID: "acme-corp", Name: "Acme Corp"},
+		"key-beta-5678": {ID: "beta-inc", Name: "Beta Inc"},
+		"key-dev-local": {ID: "dev", Name: "Local Dev"},
 	})
 }
 

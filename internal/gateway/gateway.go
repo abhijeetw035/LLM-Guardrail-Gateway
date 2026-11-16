@@ -1,5 +1,4 @@
 // Package gateway implements the HTTP server and request handler.
-//
 package gateway
 
 import (
@@ -53,7 +52,7 @@ type Server struct {
 	mux         *http.ServeMux
 	authStore   *auth.Store
 	scanner     *input.Scanner
-	policy      *policy.Watcher        // nil when no policy file configured
+	policy      *policy.Watcher         // nil when no policy file configured
 	limiter     *ratelimit.Limiter      // nil when Redis not configured
 	quota       *ratelimit.QuotaCounter // nil when Redis not configured
 	policyCache *cache.PolicyCache      // nil when Redis not configured
@@ -63,10 +62,10 @@ type Server struct {
 // New creates a Server and registers all routes.
 func New(cfg config.Config, log *logger.Logger) *Server {
 	s := &Server{
-		cfg:       cfg,
-		log:       log,
-		mux:       http.NewServeMux(),
-		scanner:   input.NewScanner(),
+		cfg:     cfg,
+		log:     log,
+		mux:     http.NewServeMux(),
+		scanner: input.NewScanner(),
 	}
 
 	// Load API keys from GATEWAY_API_KEYS (falls back to dev keys if unset).
@@ -99,8 +98,8 @@ func New(cfg config.Config, log *logger.Logger) *Server {
 			// Non-fatal: gateway starts without rate limiting and caching.
 		} else {
 			log.Info("redis_connected", map[string]any{"addr": cfg.RedisAddr})
-			s.limiter     = ratelimit.NewLimiter(rdb, cfg.RateLimitPerMinute, time.Minute)
-			s.quota       = ratelimit.NewQuotaCounter(rdb, cfg.DailyTokenQuota)
+			s.limiter = ratelimit.NewLimiter(rdb, cfg.RateLimitPerMinute, time.Minute)
+			s.quota = ratelimit.NewQuotaCounter(rdb, cfg.DailyTokenQuota)
 			s.policyCache = cache.NewPolicyCache(rdb)
 		}
 	}
@@ -250,10 +249,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
-
-
-// This function is the main request handler for POST /v1/complete in gateway.go. 
-// It takes the user prompt, applies safety checks, forwards it to the model, 
+// This function is the main request handler for POST /v1/complete in gateway.go.
+// It takes the user prompt, applies safety checks, forwards it to the model,
 // and then records token usage.
 
 // handleComplete processes POST /v1/complete.
@@ -299,11 +296,11 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 	// --- Input guardrail scan ---
 	result := s.scanner.Scan(r.Context(), req.Prompt)
 	s.log.Info("guardrail_scan", map[string]any{
-		"request_id":  reqID,
-		"tenant_id":   tenant.ID,
-		"score":       result.Score,
-		"verdict":     string(result.Verdict),
-		"signals":     result.Signals,
+		"request_id": reqID,
+		"tenant_id":  tenant.ID,
+		"score":      result.Score,
+		"verdict":    string(result.Verdict),
+		"signals":    result.Signals,
 	})
 
 	if result.Verdict == input.VerdictBlock {

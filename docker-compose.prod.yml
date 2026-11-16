@@ -1,0 +1,59 @@
+# Production stack. Only Caddy publishes ports (80/443); Redis and the gateway
+# are reachable only on the internal compose network.
+#
+#   DOMAIN=gateway.example.com docker compose -f docker-compose.prod.yml up -d --build
+#
+# Requires .env with LLM_PROVIDER, LLM_API_KEY, LLM_MODEL, GATEWAY_API_KEYS.
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    restart: unless-stopped
+    stop_grace_period: 35s   # > the gateway's 30s graceful shutdown
+    env_file:
+      - .env
+    environment:
+      GATEWAY_LISTEN_ADDR: ":8080"
+      REDIS_ADDR: "redis:6379"
+      RATE_LIMIT_PER_MINUTE: "60"
+      DAILY_TOKEN_QUOTA: "100000"
+      GATEWAY_POLICY_FILE: "configs/dev.policy"
+      LLM_PROVIDER: ${LLM_PROVIDER:?set LLM_PROVIDER in .env}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-openai/gpt-oss-20b}
+      GATEWAY_API_KEYS: ${GATEWAY_API_KEYS:?set GATEWAY_API_KEYS in .env}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./configs:/root/configs
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN}
+    volumes:
+      - ./configs/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - gateway
+
+volumes:
+  caddy_data:
+  caddy_config:

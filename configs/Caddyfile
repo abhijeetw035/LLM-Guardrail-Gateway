@@ -1,0 +1,9 @@
+{$DOMAIN} {
+	# Internal-only: don't expose metrics through the public proxy.
+	respond /metrics* 404
+
+	# flush_interval -1 streams SSE chunks immediately.
+	reverse_proxy gateway:8080 {
+		flush_interval -1
+	}
+}

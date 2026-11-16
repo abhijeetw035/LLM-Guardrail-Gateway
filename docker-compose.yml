@@ -54,7 +54,7 @@ services:
       mockllm:
         condition: service_started
     volumes:
-      - ./configs:/app/configs
+      - ./configs:/root/configs
 
 
   prometheus:

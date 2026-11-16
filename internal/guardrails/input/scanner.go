@@ -140,76 +140,164 @@ func (sc *Scanner) Scan(_ context.Context, prompt string) ScanResult {
 }
 
 // --- Signal 1: Keyword ---
-// Matches known jailbreak phrases and imperative injection literals.
-// Limitation: trivially bypassed by paraphrasing. This catches known patterns only.
+// Matches known jailbreak phrases and imperative injection literals in multiple languages.
+// Evaluates against normalized variants to defeat character spacing, leetspeak, and zero-width injection.
 var keywordPatterns = regexp.MustCompile(
-	`(?i)(ignore\s+(all\s+)?(previous|prior|above|earlier)\s+instructions?` +
-		`|disregard\s+(all\s+)?(previous|prior|above)\s+instructions?` +
-		`|forget\s+(everything|all|your|what)\s` +
-		`|you\s+(are\s+now|must\s+now|will\s+now|have\s+to)` +
-		`|override\s+(your\s+)?(instructions?|programming|rules?|constraints?)` +
-		`|do\s+anything\s+now` +
-		`|dan\s+mode` +
+	`(?i)(ignore\s*(all\s*)?(previous|prior|above|earlier)\s*instructions?` +
+		`|disregard\s*(all\s*)?(previous|prior|above)\s*instructions?` +
+		`|forget\s*(everything|all|your|what)\s*` +
+		`|you\s*(are\s*now|must\s*now|will\s*now|have\s*to)` +
+		`|override\s*(your\s*)?(instructions?|programming|rules?|constraints?)` +
+		`|do\s*anything\s*now` +
+		`|dan\s*mode` +
 		`|jailbreak` +
-		`|pretend\s+(you\s+are|to\s+be)\s+(an?\s+)?(unfiltered|unrestricted|evil)` +
-		`|hypothetically\s+speaking.*instruct` +
-		`|in\s+this\s+fictional\s+scenario` +
+		`|pretend\s*(you\s*are|to\s*be)\s*(an?\s*)?(unfiltered|unrestricted|evil)` +
+		`|hypothetically\s*speaking.*instruct` +
+		`|in\s*this\s*fictional\s*scenario` +
+		// Spanish / Portuguese
+		`|ignora(r)?\s*(todas\s*las\s*)?(instrucciones\s*)?(anteriores|previas)` +
+		`|olvida\s*(todo|todas\s*las\s*instrucciones)` +
+		`|ignore\s*(todas\s*as\s*)?instru[cç][oõ]es\s*anteriores` +
+		`|esque[cç]a\s*(tudo|todas\s*as\s*instru[cç][oõ]es)` +
+		// French
+		`|ignore(r)?\s*(toutes\s*les\s*)?instructions?\s*pr[eé]c[eé]dentes?` +
+		`|oublie(r)?\s*(tout|toutes\s*les\s*instructions)` +
+		// German
+		`|ignoriere?\s*(alle\s*)?(vorherigen?|bisherigen?)\s*anweisungen?` +
+		`|vergiss\s*(alles|alle\s*anweisungen)` +
+		// Italian
+		`|ignora\s*(tutte\s*le\s*)?istruzioni\s*precedenti` +
+		`|dimentica\s*(tutto|tutte\s*le\s*istruzioni)` +
+		// Russian
+		`|игнорируй(те)?\s*(все\s*)?(предыдущие\s*)?инструкции` +
+		`|забудь\s*(все\s*)?инструкции` +
+		// Chinese (Simplified & Traditional)
+		`|忽略(所有)?(之前|先前|前面|上述)的?(指令|提示|规则|指示)` +
+		`|忘记(所有)?(之前|先前)的?(指令|指示)` +
+		`|无视(所有)?(之前|先前)的?(指令|指示)` +
+		// Japanese
+		`|(以前|これまでの?|前)の?(指示|命令|プロンプト)を?(無視|忘れ)` +
 		`)`,
 )
 
 func keywordSignal(prompt string) float64 {
-	matches := keywordPatterns.FindAllString(prompt, -1)
-	if len(matches) == 0 {
-		return 0.0
+	var maxScore float64
+	for _, variant := range normalizeVariants(prompt) {
+		matches := keywordPatterns.FindAllString(variant, -1)
+		if len(matches) > 0 {
+			score := math.Min(float64(len(matches))*0.60, 1.0)
+			if score > maxScore {
+				maxScore = score
+			}
+		}
 	}
-	// One match → 0.6; two or more → 1.0.
-	score := math.Min(float64(len(matches))*0.60, 1.0)
-	return score
+	return maxScore
 }
 
 // --- Signal 2: Structural ---
-// Detects imperative patterns that attempt to redefine the model's role or persona.
-// These are structural, not just keyword-based: "act as X", "you are now X".
+// Detects imperative patterns that attempt to redefine the model's role or persona across languages.
 var structuralPatterns = regexp.MustCompile(
-	`(?i)(act\s+as\s+(an?\s+)?` +
-		`|you\s+are\s+now\s+(an?\s+)?` +
-		`|your\s+new\s+(role|persona|name|identity)\s+is` +
-		`|switch\s+to\s+(developer|admin|root|god|unrestricted)\s+mode` +
-		`|enable\s+(developer|debug|admin|jailbreak)\s+mode` +
-		`|from\s+now\s+on\s+you\s+(will|must|should|are)` +
-		`|respond\s+as\s+if\s+you\s+(have\s+no|don.t\s+have)\s+(restrictions?|guidelines?|rules?)` +
+	`(?i)(act\s*as\s*(an?\s*)?` +
+		`|you\s*are\s*now\s*(an?\s*)?` +
+		`|your\s*new\s*(role|persona|name|identity)\s*is` +
+		`|switch\s*to\s*(developer|admin|root|god|unrestricted)\s*mode` +
+		`|enable\s*(developer|debug|admin|jailbreak)\s*mode` +
+		`|from\s*now\s*on\s*you\s*(will|must|should|are)` +
+		`|respond\s*as\s*if\s*you\s*(have\s*no|don.t\s*have)\s*(restrictions?|guidelines?|rules?)` +
+		// Spanish / Portuguese
+		`|act[uú]a\s*como\s*(un?\s*)?` +
+		`|eres\s*ahora\s*(un?\s*)?` +
+		`|atue\s*como\s*` +
+		`|voc[eê]\s*agora\s*[eé]` +
+		`|modo\s*(desarrollador|desenvolvedor|dan|sin\s*restricciones)` +
+		// French
+		`|agis\s*(comme|en\s*tant\s*que)` +
+		`|tu\s*es\s*maintenant` +
+		`|mode\s*(d[eé]veloppeur|dan|sans\s*restriction)` +
+		// German
+		`|(agiere|handle)\s*als` +
+		`|du\s*bist\s*jetzt` +
+		`|entwicklermodus` +
+		// Russian
+		`|действуй\s*как` +
+		`|ты\s*теперь` +
+		// Chinese
+		`|你现在(是|扮演|充当)` +
+		`|扮演(一个)?(无限制|没有约束|不受限制)` +
+		`|(进入|开启)(开发者模式|上帝模式|DAN模式)` +
+		// Japanese
+		`|として振る舞` +
 		`)`,
 )
 
 func structuralSignal(prompt string) float64 {
-	matches := structuralPatterns.FindAllString(prompt, -1)
-	if len(matches) == 0 {
-		return 0.0
+	var maxScore float64
+	for _, variant := range normalizeVariants(prompt) {
+		matches := structuralPatterns.FindAllString(variant, -1)
+		if len(matches) > 0 {
+			score := math.Min(float64(len(matches))*0.65, 1.0)
+			if score > maxScore {
+				maxScore = score
+			}
+		}
 	}
-	// One structural override → 0.65; two → 1.0.
-	return math.Min(float64(len(matches))*0.65, 1.0)
+	return maxScore
 }
 
 // --- Signal 3: Repetition density ---
-// High density of override verbs is a strong indicator of an injection attempt.
-// Legitimate prompts rarely contain many instances of "ignore", "forget", "disregard".
+// High density of override verbs is a strong indicator of an injection attempt across languages.
 var overrideVerbs = regexp.MustCompile(
-	`(?i)\b(ignore|forget|disregard|override|bypass|circumvent|violate|disobey)\b`,
+	`(?i)\b(` +
+		`ignore|forget|disregard|override|bypass|circumvent|violate|disobey` +
+		`|ignora|ignorar|olvida|olvidar|desobedecer|anular` +
+		`|ignorer|oublier|contourner|outrepasser` +
+		`|ignorieren|vergessen|umgehen` +
+		`|esqueça|esquecer` +
+		`|dimentica|dimenticare` +
+		`|игнорируй|забудь|обойти` +
+		`)\b|(` +
+		`忽略|无视|忘记|绕过|违背` +
+		`|無視|忘れ|回避` +
+		`)`,
 )
 
 func repetitionSignal(prompt string) float64 {
-	words := strings.Fields(prompt)
-	if len(words) == 0 {
-		return 0.0
+	var maxScore float64
+	for _, variant := range normalizeVariants(prompt) {
+		words := strings.Fields(variant)
+		if len(words) == 0 {
+			continue
+		}
+		hits := float64(len(overrideVerbs.FindAllString(variant, -1)))
+		density := hits / float64(len(words))
+		var score float64
+		if density >= 0.50 {
+			score = 1.0
+		} else {
+			score = math.Min(density/0.05, 1.0)
+		}
+		if score > maxScore {
+			maxScore = score
+		}
 	}
-	hits := float64(len(overrideVerbs.FindAllString(prompt, -1)))
-	density := hits / float64(len(words))
-	// > 50% override verb density is an unambiguous attack pattern → 1.0 immediately.
-	// Otherwise scale: 5% density → score 1.0.
-	if density >= 0.50 {
-		return 1.0
+
+	// Spaced token-splitting anomaly: if > 40% of words are single characters
+	// and at least one override verb or keyword was matched in the collapsed variants:
+	origWords := strings.Fields(prompt)
+	if len(origWords) >= 5 {
+		singleCharCount := 0
+		for _, w := range origWords {
+			if len([]rune(w)) == 1 {
+				singleCharCount++
+			}
+		}
+		ratio := float64(singleCharCount) / float64(len(origWords))
+		if ratio >= 0.40 && maxScore > 0 {
+			maxScore = math.Max(maxScore, 0.85)
+		}
 	}
-	return math.Min(density/0.05, 1.0)
+
+	return maxScore
 }
 
 // --- Signal 4: System prompt boundary confusion ---

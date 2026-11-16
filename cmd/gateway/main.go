@@ -26,11 +26,12 @@ func main() {
 	})
 
 	srv := &http.Server{
-		Addr:         cfg.ListenAddr,
-		Handler:      gateway.New(cfg, log).Handler(),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              cfg.ListenAddr,
+		Handler:           gateway.New(cfg, log).Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      0, // streams can run long
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// Start server in a goroutine so we can listen for shutdown signals.
@@ -55,8 +56,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Graceful shutdown: give in-flight requests up to 10 seconds to finish.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Graceful shutdown: give in-flight streams up to 30 seconds to finish.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Error("gateway_shutdown_error", map[string]any{"error": err.Error()})

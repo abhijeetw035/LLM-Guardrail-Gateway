@@ -66,9 +66,17 @@ func New(cfg config.Config, log *logger.Logger) *Server {
 		cfg:       cfg,
 		log:       log,
 		mux:       http.NewServeMux(),
-		authStore: auth.DefaultStore(),
 		scanner:   input.NewScanner(),
 	}
+
+	// Load API keys from GATEWAY_API_KEYS (falls back to dev keys if unset).
+	// A malformed value denies all requests rather than exposing the public dev keys.
+	authStore, err := auth.NewStoreFromEnv()
+	if err != nil {
+		log.Error("auth_keys_invalid", map[string]any{"error": err.Error()})
+		authStore = auth.NewStore(map[string]auth.Tenant{})
+	}
+	s.authStore = authStore
 
 	// Initialise the LLM provider adapter.
 	llmAdapter, err := provider.New(cfg)

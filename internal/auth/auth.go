@@ -12,6 +12,8 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 )
 
@@ -42,6 +44,52 @@ func DefaultStore() *Store {
 		"key-beta-5678":  {ID: "beta-inc", Name: "Beta Inc"},
 		"key-dev-local":  {ID: "dev", Name: "Local Dev"},
 	})
+}
+
+// EnvKeys is the environment variable holding "key:tenantID:Name,..." entries.
+const EnvKeys = "GATEWAY_API_KEYS"
+
+// ParseKeys parses "key:tenantID:Name,key2:tenantID2:Name2". The name is
+// optional (defaults to the tenant ID) and may contain colons.
+func ParseKeys(raw string) (map[string]Tenant, error) {
+	keys := map[string]Tenant{}
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.SplitN(entry, ":", 3)
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("malformed API key entry (want key:tenant[:name])")
+		}
+		key, id := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		if key == "" || id == "" {
+			return nil, fmt.Errorf("malformed API key entry: empty key or tenant id")
+		}
+		name := id
+		if len(parts) == 3 && strings.TrimSpace(parts[2]) != "" {
+			name = strings.TrimSpace(parts[2])
+		}
+		keys[key] = Tenant{ID: id, Name: name}
+	}
+	return keys, nil
+}
+
+// NewStoreFromEnv builds a Store from GATEWAY_API_KEYS. If the variable is
+// empty, it falls back to DefaultStore (local development only).
+func NewStoreFromEnv() (*Store, error) {
+	raw := strings.TrimSpace(os.Getenv(EnvKeys))
+	if raw == "" {
+		return DefaultStore(), nil
+	}
+	keys, err := ParseKeys(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return DefaultStore(), nil
+	}
+	return NewStore(keys), nil
 }
 
 // Authenticate extracts and validates the API key from the Authorization header.

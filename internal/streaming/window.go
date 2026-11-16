@@ -162,6 +162,13 @@ func (s *outScanner) containsUnsafe(data []byte) bool {
 	return false
 }
 
+// ContainsUnsafe reports whether text matches any output-policy pattern.
+// It uses the same scanner as the streaming window, so synchronous responses
+// are held to the same rules as streamed ones.
+func ContainsUnsafe(text string) bool {
+	return globalOutScanner.containsUnsafe([]byte(text))
+}
+
 // Previous Issue :
 // When used the Mock LLM, it streamed whole words (data: AKIAIOSFODNN7AX3KPFA \n\n).
 // But Groq streams subword tokens (data: AK, data: IA, data: IOS).

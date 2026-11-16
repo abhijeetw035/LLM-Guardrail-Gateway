@@ -259,8 +259,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 //  1. Enforce body size limit — reject 413 before any parsing.
 //  2. Decode JSON prompt.
 //  3. Run input guardrail scan — block or tag based on composite risk score.
-//  4. Forward to mock LLM.
-//  5. Return response.
+//  4. Forward to the LLM provider and record token usage.
+//  5. Run the output scanner; block with 403 on violation.
+//  6. Return response.
 func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromCtx(r.Context())
 	tenant, _ := auth.TenantFromCtx(r.Context())
@@ -362,28 +363,48 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		"output_tokens": provResult.OutputTokens,
 	})
 
+	// Track token usage first: the LLM call was made (and billed) even if the
+	// output is blocked below.
+	s.recordUsage(r.Context(), reqID, tenant.ID, req.Prompt, provResult)
+
+	// --- Output guardrail scan (same scanner as the streaming window) ---
+	if streaming.ContainsUnsafe(provResult.Text) {
+		s.log.Warn("output_blocked", map[string]any{
+			"request_id": reqID,
+			"tenant_id":  tenant.ID,
+			"mode":       "sync",
+		})
+		metrics.GuardrailBlocksTotal.WithLabelValues(tenant.ID, "output_sync").Inc()
+		s.writeError(w, http.StatusForbidden, "output_policy_violation", reqID)
+		return
+	}
+
 	// --- Return response ---
 	s.writeJSON(w, http.StatusOK, CompletionResponse{
 		RequestID: reqID,
 		Response:  provResult.Text,
 	})
+}
 
-	// Track token usage. Use real token counts when available (from provider),
-	// otherwise fall back to the 1-token-per-4-chars heuristic.
-	if s.quota != nil {
-		tokens := int64(provResult.InputTokens + provResult.OutputTokens)
-		if tokens < 1 {
-			tokens = int64((len(req.Prompt) + len(provResult.Text)) / 4)
-		}
-		if tokens < 1 {
-			tokens = 1
-		}
-		if _, _, err := s.quota.Add(r.Context(), tenant.ID, tokens); err != nil {
-			s.log.Error("quota_add_error", map[string]any{
-				"request_id": reqID,
-				"error":      err.Error(),
-			})
-		}
+// recordUsage adds the call's token usage to the tenant's daily quota. It uses
+// real token counts when the provider reports them, otherwise falls back to
+// the 1-token-per-4-chars heuristic.
+func (s *Server) recordUsage(ctx context.Context, reqID, tenantID, prompt string, res provider.GenerateResult) {
+	if s.quota == nil {
+		return
+	}
+	tokens := int64(res.InputTokens + res.OutputTokens)
+	if tokens < 1 {
+		tokens = int64((len(prompt) + len(res.Text)) / 4)
+	}
+	if tokens < 1 {
+		tokens = 1
+	}
+	if _, _, err := s.quota.Add(ctx, tenantID, tokens); err != nil {
+		s.log.Error("quota_add_error", map[string]any{
+			"request_id": reqID,
+			"error":      err.Error(),
+		})
 	}
 }
 
